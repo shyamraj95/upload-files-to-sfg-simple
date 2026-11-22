@@ -1,0 +1,193 @@
+# ==============================================================================
+# Oracle to IBM Sterling File Gateway (SFG) Exporter Configuration
+#
+# SECURITY POLICY:
+#   - NEVER hardcode passwords, passphrases, or private keys in this file.
+#   - All sensitive values MUST resolve from server environment variables.
+#   - Strict host key checking is enabled by default using a mounted known_hosts.
+# ==============================================================================
+
+spring:
+  application:
+    name: oracle-sfg-exporter
+  main:
+    # Pure scheduled worker — no embedded web server overhead
+    web-application-type: none
+
+  # Oracle Database Connection (HikariCP)
+  datasource:
+    url: ${ORACLE_DB_URL}
+    username: ${ORACLE_DB_USER}
+    password: ${ORACLE_DB_PASSWORD}
+    driver-class-name: oracle.jdbc.OracleDriver
+    hikari:
+      pool-name: oracle-sfg-hikari
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 20000
+      idle-timeout: 300000
+      max-lifetime: 1800000
+
+# Minimal operational health endpoint (Spring Boot 4 access model; no web controllers)
+management:
+  endpoints:
+    access:
+      default: none
+  endpoint:
+    health:
+      access: read-only
+      show-details: when-authorized
+
+logging:
+  level:
+    root: INFO
+    com.enterprise.sfgexporter: INFO
+    # Keep JDBC and SSHD loggers at WARN/INFO so SQL parameters/row payloads are never emitted
+    org.springframework.jdbc: WARN
+    org.apache.sshd: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%thread] [job=%X{jobName:-none} run=%X{runId:-none}] %logger{36} - %msg%n"
+
+# ==============================================================================
+# Application Pipeline Configuration
+# ==============================================================================
+app:
+  # Local filesystem staging, daily backup archive, and 15-day retention cleanup
+  storage:
+    staging-dir: ${APP_STAGING_DIR:/var/app/sfg-exporter/staging}
+    backup-dir: ${APP_BACKUP_DIR:/var/app/sfg-exporter/backup}
+    retention-days: ${APP_BACKUP_RETENTION_DAYS:15}
+    # Daily cleanup at 02:00 UTC deletes backup files and empty date folders older than retention-days
+    cleanup-cron: "0 0 2 * * *"
+    cleanup-time-zone: "UTC"
+
+  # Dedicated thread pool for concurrent independent job schedules
+  scheduler:
+    pool-size: 4
+    thread-name-prefix: "sfg-job-"
+    await-termination-seconds: 60
+
+  # ----------------------------------------------------------------------------
+  # Named IBM Sterling File Gateway (SFG) SFTP Targets
+  # Multiple jobs can reference the same target or point to separate SFG servers.
+  # ----------------------------------------------------------------------------
+  sftp-targets:
+    sfg-primary:
+      host: ${SFG_PRIMARY_HOST}
+      port: ${SFG_PRIMARY_PORT:22}
+      username: ${SFG_PRIMARY_USER}
+      # Preferred: SSH Private Key authentication (mounted read-only with chmod 600)
+      private-key-path: ${SFG_SSH_KEY_PATH}
+      private-key-passphrase: ${SFG_SSH_KEY_PASSPHRASE:}
+      # Mandatory server-mounted OpenSSH known_hosts file (rejects unknown host keys by default)
+      known-hosts-path: ${SFG_KNOWN_HOSTS_PATH}
+      strict-host-key-checking: true
+      connect-timeout-ms: 15000
+      auth-timeout-ms: 15000
+      channel-open-timeout-ms: 15000
+      # Atomic upload: uploads as <filename>.tmp then renames to <filename>.csv
+      temp-suffix: ".tmp"
+      remote-base-dir: "/inbound"
+      # Modern strong cryptographic algorithms only (CBC, 3DES, SHA-1, MD5 disabled)
+      allowed-ciphers:
+        - "aes256-gcm@openssh.com"
+        - "aes128-gcm@openssh.com"
+        - "chacha20-poly1305@openssh.com"
+        - "aes256-ctr"
+        - "aes192-ctr"
+        - "aes128-ctr"
+      allowed-key-exchanges:
+        - "curve25519-sha256"
+        - "ecdh-sha2-nistp521"
+        - "ecdh-sha2-nistp384"
+        - "ecdh-sha2-nistp256"
+        - "diffie-hellman-group18-sha512"
+        - "diffie-hellman-group16-sha512"
+        - "diffie-hellman-group14-sha256"
+        - "diffie-hellman-group-exchange-sha256"
+      allowed-macs:
+        - "hmac-sha2-512-etm@openssh.com"
+        - "hmac-sha2-256-etm@openssh.com"
+        - "hmac-sha2-512"
+        - "hmac-sha2-256"
+      retry:
+        max-attempts: 4
+        initial-backoff-ms: 2000
+        multiplier: 2.0
+        max-backoff-ms: 30000
+
+    # Secondary SFG target example using Password authentication (if key auth is unavailable)
+    sfg-partner-b:
+      host: ${SFG_SECONDARY_HOST:localhost}
+      port: ${SFG_SECONDARY_PORT:2222}
+      username: ${SFG_SECONDARY_USER:placeholder}
+      password: ${SFG_SFTP_PASSWORD:}
+      known-hosts-path: ${SFG_SECONDARY_KNOWN_HOSTS_PATH:${SFG_KNOWN_HOSTS_PATH:}}
+      strict-host-key-checking: true
+      temp-suffix: ".tmp"
+      remote-base-dir: "/partner_drop"
+      retry:
+        max-attempts: 3
+        initial-backoff-ms: 3000
+        multiplier: 2.0
+        max-backoff-ms: 30000
+
+  # ----------------------------------------------------------------------------
+  # Configurable Export Jobs (List-Based Extensibility)
+  # Add a new pipeline simply by appending a YAML block here (and optional .sql file).
+  # All names, schema/package/procedure identifiers, and file prefixes must match ^[a-zA-Z0-9_]+$
+  # ----------------------------------------------------------------------------
+  jobs:
+    # Job 1: Oracle PL/SQL Stored Procedure returning SYS_REFCURSOR
+    - name: daily_gl_journal_export
+      enabled: true
+      # Spring 6-field cron: sec min hour day-of-month month day-of-week (Daily at 06:00 UTC)
+      cron: "0 0 6 * * *"
+      time-zone: "UTC"
+      source-type: STORED_PROCEDURE
+      schema-name: "FIN_REPORTING"
+      package-name: "PKG_SFG_EXPORTS"
+      procedure-name: "SP_EXPORT_DAILY_GL_JOURNALS"
+      cursor-param-name: "P_RESULT_CURSOR"
+      parameters:
+        P_LOOKBACK_DAYS: 1
+        P_LEDGER_CODE: "CORP_US"
+      fetch-size: 2000
+      query-timeout-seconds: 600
+      file-prefix: "GL_JOURNAL"
+      timestamp-pattern: "yyyyMMdd_HHmmss"
+      csv:
+        delimiter: ","
+        include-header: true
+        quote-char: "\""
+        record-separator: "\n"
+        null-string: ""
+        charset: "UTF-8"
+        write-empty-file: true
+      sftp-target: sfg-primary
+      remote-dir: "/finance/gl"
+
+    # Job 2: Parameterized external SQL query file (pipe-delimited, disabled by default as template)
+    - name: hourly_payment_settlement
+      enabled: false
+      cron: "0 15 * * * *"
+      time-zone: "America/New_York"
+      source-type: SQL_QUERY
+      sql-file: "classpath:sql/hourly_payment_settlement.sql"
+      parameters:
+        lookback_hours: 1
+        settlement_status: "SETTLED"
+      fetch-size: 1000
+      query-timeout-seconds: 300
+      file-prefix: "PMT_SETTLEMENT"
+      timestamp-pattern: "yyyyMMdd_HHmmss"
+      csv:
+        delimiter: "|"
+        include-header: true
+        quote-char: "\""
+        record-separator: "\r\n"
+        null-string: ""
+        charset: "UTF-8"
+        write-empty-file: false
+      sftp-target: sfg-partner-b
+      remote-dir: "/settlements"

@@ -1,0 +1,33 @@
+# Maven build output
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+
+# Local environment secrets (NEVER commit)
+.env
+.env.*
+!.env.example
+
+# Local SSH keys and known_hosts
+*.pem
+*.key
+*.ppk
+id_rsa*
+id_ed25519*
+known_hosts
+
+# Runtime working directories
+data/
+staging/
+backup/
+logs/
+
+# IDE & OS files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
