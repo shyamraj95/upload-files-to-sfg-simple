@@ -15,10 +15,11 @@ A clean, lightweight, production-hardened **Java 21 + Spring Boot 4.1.3** worker
 7. [Oracle Database Setup](#oracle-database-setup)
 8. [Linux Server & IBM SFG Security Preparation](#linux-server--ibm-sfg-security-preparation)
 9. [Adding a New Export Pipeline (Zero Code Changes)](#adding-a-new-export-pipeline-zero-code-changes)
-10. [Building, Testing & Packaging](#building-testing--packaging)
-11. [Deployment (`systemd` & Containers/Kubernetes)](#deployment-systemd--containerskubernetes)
-12. [Observability, Failure Recovery & Horizontal Scaling](#observability-failure-recovery--horizontal-scaling)
-13. [Troubleshooting Guide](#troubleshooting-guide)
+10. [Running Multiple Queries on Different Schedules to Separate CSVs & SFG Paths](#running-multiple-queries-on-different-schedules-to-separate-csvs--sfg-paths)
+11. [Building, Testing & Packaging](#building-testing--packaging)
+12. [Deployment (`systemd` & Containers/Kubernetes)](#deployment-systemd--containerskubernetes)
+13. [Observability, Failure Recovery & Horizontal Scaling](#observability-failure-recovery--horizontal-scaling)
+14. [Troubleshooting Guide](#troubleshooting-guide)
 
 ---
 
@@ -291,7 +292,7 @@ app:
       procedure-name: "SP_EXPORT_AP_INVOICES"
       cursor-param-name: "P_RESULT_CURSOR"
       parameters:
-        P_COMPANY_CODE: "US01"
+        "[P_COMPANY_CODE]": "US01"
       fetch-size: 2000
       file-prefix: "AP_INVOICE"
       sftp-target: sfg-primary
@@ -323,7 +324,123 @@ app:
       remote-dir: "/finance/vendors"
 ```
 
-All names, SQL identifiers, and prefixes are validated at startup against `^[a-zA-Z0-9_]+$`; invalid entries or missing `.sql` files fail fast immediately on boot.
+All names, SQL identifiers, and prefixes are validated at startup against `^\w+$` (ASCII `[a-zA-Z0-9_]`); invalid entries or missing `.sql` files fail fast immediately on boot.
+
+---
+
+## Running Multiple Queries on Different Schedules to Separate CSVs & SFG Paths
+
+Running two (or more) independent queries on different schedules—each producing its own timestamped CSV and uploading to a separate IBM SFG directory or server—requires **zero Java code changes**.
+
+### Step 1: Create Separate SQL Files
+
+Place each query in its own `.sql` file under `src/main/resources/sql/` (packaged in the JAR) or on the host under `/etc/sfg-exporter/sql/` (externalized, editable without rebuilding):
+
+- **Query 1** (`/etc/sfg-exporter/sql/payment_settlements.sql` — runs every 15 minutes):
+  ```sql
+  SELECT payment_id, batch_reference, currency_code, amount, updated_at_utc
+  FROM fin_reporting.payment_settlements
+  WHERE settlement_status = :settlement_status
+    AND updated_at_utc >= (SYSTIMESTAMP AT TIME ZONE 'UTC') - NUMTODSINTERVAL(:lookback_minutes, 'MINUTE')
+  ORDER BY updated_at_utc ASC, payment_id ASC
+  ```
+- **Query 2** (`/etc/sfg-exporter/sql/daily_reconciliation.sql` — runs once daily at 06:30 UTC):
+  ```sql
+  SELECT account_number, currency_code, opening_balance, closing_balance, business_date
+  FROM fin_reporting.daily_reconciliation
+  WHERE business_date = TRUNC(SYSDATE) - :lookback_days
+  ORDER BY account_number ASC
+  ```
+
+### Step 2: Configure Two Independent Entries Under `app.jobs[]`
+
+Add both jobs to `application.yml` (or `/etc/sfg-exporter/application.yml`), giving each its own `cron`, `time-zone`, `sql-file`, `file-prefix`, `sftp-target`, and `remote-dir`:
+
+```yaml
+app:
+  sftp-targets:
+    "[sfg-primary]":
+      host: ${SFG_PRIMARY_HOST}
+      port: ${SFG_PRIMARY_PORT:22}
+      username: ${SFG_PRIMARY_USER}
+      private-key-path: ${SFG_SSH_KEY_PATH}
+      private-key-passphrase: ${SFG_SSH_KEY_PASSPHRASE:}
+      known-hosts-path: ${SFG_KNOWN_HOSTS_PATH}
+      strict-host-key-checking: true
+      temp-suffix: ".tmp"
+      remote-base-dir: "/inbound"
+
+  jobs:
+    # Query 1: Runs every 15 minutes -> generates PMT_SETTLEMENT_*.csv -> uploads to /inbound/payments/settled/
+    - name: payment_settlements_15m
+      enabled: true
+      cron: "0 */15 * * * *"
+      time-zone: "UTC"
+      source-type: SQL_QUERY
+      sql-file: "file:/etc/sfg-exporter/sql/payment_settlements.sql"
+      parameters:
+        "[settlement_status]": "SETTLED"
+        "[lookback_minutes]": 15
+      fetch-size: 1000
+      query-timeout-seconds: 180
+      file-prefix: "PMT_SETTLEMENT"
+      timestamp-pattern: "yyyyMMdd_HHmmss"
+      csv:
+        delimiter: ","
+        include-header: true
+        write-empty-file: false
+      sftp-target: sfg-primary
+      remote-dir: "/payments/settled"
+
+    # Query 2: Runs daily at 06:30 America/New_York -> generates DAILY_RECON_*.csv -> uploads to /inbound/finance/recon/
+    - name: daily_reconciliation_export
+      enabled: true
+      cron: "0 30 6 * * *"
+      time-zone: "America/New_York"
+      source-type: SQL_QUERY
+      sql-file: "file:/etc/sfg-exporter/sql/daily_reconciliation.sql"
+      parameters:
+        "[lookback_days]": 1
+      fetch-size: 2000
+      query-timeout-seconds: 600
+      file-prefix: "DAILY_RECON"
+      timestamp-pattern: "yyyyMMdd_HHmmss"
+      csv:
+        delimiter: "|"
+        include-header: true
+        write-empty-file: true
+      sftp-target: sfg-primary              # Or point to a second target (e.g. `sfg-partner-b`) for another SFG server
+      remote-dir: "/finance/recon"
+```
+
+#### Common Spring 6-Field Cron Schedules (`sec min hour day-of-month month day-of-week`)
+
+| Cadence | Cron Expression |
+| --- | --- |
+| Every 15 minutes | `0 */15 * * * *` |
+| Every hour at `:10` | `0 10 * * * *` |
+| Every 4 hours | `0 0 */4 * * *` |
+| Daily at 06:30 | `0 30 6 * * *` |
+| Weekdays (Mon–Fri) at 18:00 | `0 0 18 * * MON-FRI` |
+
+### Step 3: Tune Thread & Connection Pool Sizing (If Schedules Can Overlap)
+
+- Each job runs independently on `ThreadPoolTaskScheduler` (`app.scheduler.pool-size`, default `4`) using its own HikariCP Oracle connection (`spring.datasource.hikari.maximum-pool-size`, default `5`).
+- If you configure more than 4 jobs whose schedules can fire at the same time, increase both `app.scheduler.pool-size` and `spring.datasource.hikari.maximum-pool-size` accordingly.
+- Each job has its own per-job `ReentrantLock` in `ExportJobOrchestrator`, so a slow run of Query 1 skips overlapping ticks of Query 1 without ever blocking Query 2.
+
+### Step 4: Verify Startup & Output Paths
+
+1. Restart the application and verify `DynamicJobScheduler` logs both jobs at startup:
+   ```text
+   Registered scheduled export job 'payment_settlements_15m' with cron='0 */15 * * * *' (zone='UTC', target='sfg-primary')
+   Registered scheduled export job 'daily_reconciliation_export' with cron='0 30 6 * * *' (zone='America/New_York', target='sfg-primary')
+   Successfully registered 2 active export job(s)
+   ```
+2. Verify separate outputs & archives:
+   - **SFG Path 1:** `/inbound/payments/settled/PMT_SETTLEMENT_<yyyyMMdd_HHmmss>.csv` (uploaded as `.tmp`, atomically renamed to `.csv`)
+   - **SFG Path 2:** `/inbound/finance/recon/DAILY_RECON_<yyyyMMdd_HHmmss>.csv` (uploaded as `.tmp`, atomically renamed to `.csv`)
+   - **Local 15-day backup:** Both CSVs are archived under `${APP_BACKUP_DIR}/yyyy-MM-dd/` with distinct prefixes and cleaned up automatically after `retention-days`.
 
 ---
 

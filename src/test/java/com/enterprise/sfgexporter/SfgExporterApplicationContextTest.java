@@ -1,6 +1,7 @@
 package com.enterprise.sfgexporter;
 
 import com.enterprise.sfgexporter.backup.BackupRetentionService;
+import com.enterprise.sfgexporter.config.AppProperties;
 import com.enterprise.sfgexporter.csv.StreamingCsvWriter;
 import com.enterprise.sfgexporter.db.OracleDataExtractor;
 import com.enterprise.sfgexporter.scheduler.DynamicJobScheduler;
@@ -52,6 +53,9 @@ class SfgExporterApplicationContextTest {
     private ExportJobOrchestrator orchestrator;
 
     @Autowired
+    private AppProperties appProperties;
+
+    @Autowired
     private ExportJobsHealthIndicator healthIndicator;
 
     @Test
@@ -62,6 +66,9 @@ class SfgExporterApplicationContextTest {
         assertThat(backupRetentionService).isNotNull();
         assertThat(dynamicJobScheduler).isNotNull();
         assertThat(orchestrator).isNotNull();
+        assertThat(appProperties.getSftpTargets()).containsKeys("sfg-primary", "sfg-partner-b");
+        assertThat(appProperties.getJobs().getFirst().getParameters())
+                .containsKeys("P_LOOKBACK_DAYS", "P_LEDGER_CODE");
         assertThat(healthIndicator.health().getStatus()).isEqualTo(Status.UP);
     }
 }

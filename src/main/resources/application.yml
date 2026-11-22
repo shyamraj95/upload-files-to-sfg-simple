@@ -41,10 +41,10 @@ management:
 logging:
   level:
     root: INFO
-    com.enterprise.sfgexporter: INFO
+    "[com.enterprise.sfgexporter]": INFO
     # Keep JDBC and SSHD loggers at WARN/INFO so SQL parameters/row payloads are never emitted
-    org.springframework.jdbc: WARN
-    org.apache.sshd: WARN
+    "[org.springframework.jdbc]": WARN
+    "[org.apache.sshd]": WARN
   pattern:
     console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%thread] [job=%X{jobName:-none} run=%X{runId:-none}] %logger{36} - %msg%n"
 
@@ -72,7 +72,7 @@ app:
   # Multiple jobs can reference the same target or point to separate SFG servers.
   # ----------------------------------------------------------------------------
   sftp-targets:
-    sfg-primary:
+    "[sfg-primary]":
       host: ${SFG_PRIMARY_HOST}
       port: ${SFG_PRIMARY_PORT:22}
       username: ${SFG_PRIMARY_USER}
@@ -117,7 +117,7 @@ app:
         max-backoff-ms: 30000
 
     # Secondary SFG target example using Password authentication (if key auth is unavailable)
-    sfg-partner-b:
+    "[sfg-partner-b]":
       host: ${SFG_SECONDARY_HOST:localhost}
       port: ${SFG_SECONDARY_PORT:2222}
       username: ${SFG_SECONDARY_USER:placeholder}
@@ -150,8 +150,8 @@ app:
       procedure-name: "SP_EXPORT_DAILY_GL_JOURNALS"
       cursor-param-name: "P_RESULT_CURSOR"
       parameters:
-        P_LOOKBACK_DAYS: 1
-        P_LEDGER_CODE: "CORP_US"
+        "[P_LOOKBACK_DAYS]": 1
+        "[P_LEDGER_CODE]": "CORP_US"
       fetch-size: 2000
       query-timeout-seconds: 600
       file-prefix: "GL_JOURNAL"
@@ -175,8 +175,8 @@ app:
       source-type: SQL_QUERY
       sql-file: "classpath:sql/hourly_payment_settlement.sql"
       parameters:
-        lookback_hours: 1
-        settlement_status: "SETTLED"
+        "[lookback_hours]": 1
+        "[settlement_status]": "SETTLED"
       fetch-size: 1000
       query-timeout-seconds: 300
       file-prefix: "PMT_SETTLEMENT"
