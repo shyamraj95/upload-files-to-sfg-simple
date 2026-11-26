@@ -55,7 +55,7 @@ A clean, lightweight, production-hardened **Java 21 + Spring Boot 4.1.3** worker
 
 ## Architectural Philosophy
 
-- **Zero Over-Engineering:** Uses only essential Spring dependencies (`spring-boot-starter`, `spring-boot-starter-jdbc`, `spring-boot-starter-actuator`, `ojdbc11`, `commons-csv`, `spring-integration-sftp`). No Spring Batch, Quartz, JPA/Hibernate, or embedded web server (`spring.main.web-application-type: none`).
+- **Zero Over-Engineering:** Uses only essential Spring dependencies (`spring-boot-starter`, `spring-boot-starter-jdbc`, `ojdbc11`, `commons-csv`, `spring-integration-sftp`). No Spring Batch, Quartz, JPA/Hibernate, Actuator, or embedded web server (`spring.main.web-application-type: none`).
 - **Flat O(1) Memory Usage:** Oracle `ResultSet` rows are never collected into a `List`. Both `STORED_PROCEDURE` and `SQL_QUERY` paths stream directly from the JDBC cursor into a 64 KB buffered CSV writer while reusing a single row array buffer and freeing Oracle temporary `CLOB`s per row.
 - **Atomic Delivery to IBM SFG:** Local CSVs write to `.part` → `.csv`, and SFTP uploads stream to `<filename>.tmp` before issuing an atomic SFTP `rename` to `<filename>.csv`. Any mid-stream write or rename error triggers best-effort remote `.tmp` cleanup.
 - **Defense-in-Depth Security:**
@@ -82,14 +82,15 @@ oracle-sfg-exporter/
     │   ├── java/com/enterprise/sfgexporter/
     │   │   ├── SfgExporterApplication.java                 # Entry point (@SpringBootApplication, @EnableScheduling)
     │   │   ├── config/
-    │   │   │   ├── AppProperties.java                      # Root @ConfigurationProperties(prefix = "app")
+    │   │   │   ├── AppProperties.java                      # Immutable @ConfigurationProperties(prefix = "app") record
     │   │   │   ├── SchedulerConfiguration.java             # ThreadPoolTaskScheduler with non-blocking graceful shutdown
     │   │   │   └── SecurityValidator.java                  # Fail-fast startup validator & allowlist/path-traversal guards
     │   │   ├── model/
-    │   │   │   ├── ExportJobConfig.java                    # Single pipeline YAML configuration model
-    │   │   │   ├── SftpTargetConfig.java                   # Named IBM SFG target config (redacted toString)
-    │   │   │   ├── CsvOptions.java                         # Delimiter, header, quote, charset, empty-file options
-    │   │   │   ├── RetryConfig.java                        # Capped exponential backoff retry configuration
+    │   │   │   ├── ExportJobConfig.java                    # Immutable single-pipeline YAML configuration record
+    │   │   │   ├── SftpTargetConfig.java                   # Immutable IBM SFG target config record (redacted toString)
+    │   │   │   ├── SecretValue.java                        # Mutable zeroable char[] secret holder for config records
+    │   │   │   ├── CsvOptions.java                         # Immutable delimiter, header, quote, charset, LOB limit record
+    │   │   │   ├── RetryConfig.java                        # Immutable capped exponential backoff retry record
     │   │   │   ├── SourceType.java                         # STORED_PROCEDURE | SQL_QUERY enum
     │   │   │   └── JobExecutionResult.java                 # Immutable execution summary record (no row data)
     │   │   ├── db/
@@ -103,8 +104,7 @@ oracle-sfg-exporter/
     │   │   └── scheduler/
     │   │       ├── BackupRetentionService.java             # staging/ -> backup/yyyy-MM-dd/ archiver & 15-day cleanup
     │   │       ├── DynamicJobScheduler.java                # Registers enabled app.jobs[] cron triggers on TaskScheduler
-    │   │       ├── ExportJobOrchestrator.java              # End-to-end execution, per-job locking, MDC correlation
-    │   │       └── ExportJobsHealthIndicator.java          # Spring Boot 4 Actuator HealthIndicator ("exportJobs")
+    │   │       └── ExportJobOrchestrator.java              # End-to-end execution, per-job locking, MDC correlation
     │   └── resources/
     │       ├── application.yml                             # Annotated multi-job & multi-target configuration
     │       └── sql/
@@ -112,7 +112,7 @@ oracle-sfg-exporter/
     │           └── sample_plsql_procedure.sql              # Reference Oracle PL/SQL SYS_REFCURSOR package DDL
     └── test/
         ├── java/com/enterprise/sfgexporter/
-        │   ├── SfgExporterApplicationContextTest.java      # Full @SpringBootTest wiring & Actuator health test
+        │   ├── SfgExporterApplicationContextTest.java      # Full @SpringBootTest wiring & config binding test
         │   ├── config/SecurityValidatorTest.java           # SQLi, path traversal, cron, cipher & SQL resource checks
         │   ├── db/StreamingCsvWriterAndExtractorTest.java  # H2 streaming SQL-to-CSV, quoting, BigDecimal, PL/SQL builder
         │   ├── sftp/AtomicSftpUploaderIntegrationTest.java # Embedded Apache MINA SFTP server (key/pass/known_hosts/retry)
@@ -130,11 +130,9 @@ oracle-sfg-exporter/
 - **Core Stack (managed via `spring-boot-starter-parent:4.1.3`):**
   - `org.springframework.boot:spring-boot-starter`
   - `org.springframework.boot:spring-boot-starter-jdbc` (HikariCP, JDBC4 native `Connection.isValid()`)
-  - `org.springframework.boot:spring-boot-starter-actuator` (health contributor, no web starter)
   - `com.oracle.database.jdbc:ojdbc11` (`runtime` scope, BOM-managed)
   - `org.apache.commons:commons-csv:1.14.1`
   - `org.springframework.integration:spring-integration-sftp` (Apache MINA SSHD, BOM-managed)
-  - `com.fasterxml.jackson.core:jackson-annotations` (`provided` scope only — satisfies compile-time `@JsonInclude` metadata on `spring-boot-health` without packaging Jackson at runtime)
   - `org.springframework.boot:spring-boot-configuration-processor` (configured under `maven-compiler-plugin` `<annotationProcessorPaths>` to generate IDE metadata for `app.*`)
 
 ---
@@ -210,10 +208,11 @@ All credentials and sensitive paths must be provided via server environment vari
 | `SFG_PRIMARY_HOST` | Yes | Primary IBM SFG SFTP hostname or IP |
 | `SFG_PRIMARY_PORT` | No | Primary IBM SFG SFTP port (default: `22`) |
 | `SFG_PRIMARY_USER` | Yes | Primary IBM SFG SFTP login username |
-| `SFG_SSH_KEY_PATH` | Key auth | Absolute path to SSH private key (`chmod 600`, preferred) |
-| `SFG_SSH_KEY_PASSPHRASE` | Optional | Passphrase if the SSH private key is encrypted |
+| `SFG_SSH_KEY_PATH` | Key auth | Absolute path to SSH private key (`chmod 600`, preferred; optional if `SFG_PRIMARY_PASSWORD` is set) |
+| `SFG_SSH_KEY_PASSPHRASE` | Optional | Passphrase if the `sfg-primary` SSH private key is encrypted |
+| `SFG_PRIMARY_PASSWORD` | Password auth | Password for `sfg-primary` when not using `SFG_SSH_KEY_PATH` (key takes precedence if both set) |
 | `SFG_KNOWN_HOSTS_PATH` | Yes* | Absolute path to pinned OpenSSH `known_hosts` (*required when strict host-key checking is enabled) |
-| `SFG_SECONDARY_*` / `SFG_SFTP_PASSWORD` | Optional | Secondary SFG target example (password auth fallback) |
+| `SFG_SECONDARY_HOST` / `SFG_SECONDARY_PORT` / `SFG_SECONDARY_USER` / `SFG_SECONDARY_SSH_KEY_PATH` / `SFG_SECONDARY_SSH_KEY_PASSPHRASE` / `SFG_SECONDARY_PASSWORD` (fallback `SFG_SFTP_PASSWORD`) / `SFG_SECONDARY_KNOWN_HOSTS_PATH` | Optional | Optional secondary target (`sfg-partner-b`, supports SSH key or password auth; validated only when referenced by an enabled job) |
 
 ---
 
@@ -366,8 +365,9 @@ app:
       host: ${SFG_PRIMARY_HOST}
       port: ${SFG_PRIMARY_PORT:22}
       username: ${SFG_PRIMARY_USER}
-      private-key-path: ${SFG_SSH_KEY_PATH}
+      private-key-path: ${SFG_SSH_KEY_PATH:}
       private-key-passphrase: ${SFG_SSH_KEY_PASSPHRASE:}
+      password: ${SFG_PRIMARY_PASSWORD:}
       known-hosts-path: ${SFG_KNOWN_HOSTS_PATH}
       strict-host-key-checking: true
       temp-suffix: ".tmp"
@@ -450,20 +450,20 @@ app:
 ## Building, Testing & Packaging
 
 ```bash
-# Clean compile (with -Xlint:all,-processing,-classfile) and run all 54 tests
+# Clean compile (with -Xlint:all,-processing,-classfile) and run all 67 tests
 mvn clean test
 
 # Build executable Spring Boot fat JAR (target/oracle-sfg-exporter-1.0.0.jar)
 mvn clean package
 ```
 
-### What the Test Suite Covers (54 Tests)
-- `SfgExporterApplicationContextTest` — Boots the full Spring Boot 4.1.3 context with H2 and verifies bean wiring, HikariCP Oracle socket timeouts, startup validation, scheduler registration, clean shutdown, and Actuator health (`UP`).
-- `SecurityValidatorTest` — Rejects SQL injection in procedure names, path traversal/UNC paths/symlinks in file prefixes/remote dirs/`sql-dir`/SQL paths, overlapping staging & backup dirs, missing `known_hosts`, disabled strict host-key checking without dev opt-in, missing auth, missing SQL files, and weak/disallowed SSH algorithms.
-- `StreamingCsvWriterAndExtractorTest` — Streams real H2 JDBC `ResultSet` rows to timestamped CSV, verifies quoting/pipes/`BigDecimal`/nulls, CSV formula injection neutralization (cells, headers, leading whitespace/newlines), bounded `CLOB`/`SQLXML` & `BLOB` resource freeing, `write-empty-file: false` skipping, oversized SQL rejection, statement cleanup on bind errors, and safe PL/SQL call generation.
-- `AtomicSftpUploaderIntegrationTest` — Spins up a real embedded Apache MINA SFTP server to verify SSH private-key auth, password auth, strict `0600` key/`known_hosts` permission checks, atomic `.tmp` → `.csv` rename, strict `known_hosts` rejection, exponential backoff retry with bulkhead release during sleep, partial `.tmp` cleanup on mid-stream failure, and cyclic exception cause / control-char sanitization.
-- `BackupRetentionServiceTest` — Verifies atomic archiving into `backup/yyyy-MM-dd/`, symlink rejection (staging files, backup root, date folders, and expired folder entries), orphan `.part` staging cleanup, deletion of files/folders older than 15 days, retention of the exact 15-day boundary, and pruning of stale empty folders.
-- `DynamicJobSchedulerAndOrchestratorTest` — Verifies enabled-only dynamic cron registration, end-to-end orchestration, and safe failure reporting without duplicate SFTP re-upload if local archiving fails after upload.
+### What the Test Suite Covers (67 Tests)
+- `SfgExporterApplicationContextTest` — Boots the full Spring Boot 4.1.3 context with H2 and verifies bean wiring, immutable `@ConfigurationProperties` record binding (defaults, nested maps/lists), HikariCP Oracle socket timeouts, startup validation, and scheduler registration.
+- `SecurityValidatorTest` — Rejects SQL injection in procedure names, path traversal/UNC paths/symlinks in file prefixes/remote dirs/`sql-dir`/SQL paths, overlapping staging & backup dirs, missing `known_hosts`, disabled strict host-key checking without dev opt-in, missing auth, missing SQL files, duplicate job names/prefixes, invalid cron/timezones/timestamp patterns/CSV options/retry bounds, and weak SSH algorithms; verifies optional `sfg-partner-b` (unconfigured or omitted), password-only `sfg-primary`, `SecretValue` redaction/zeroing, and config record immutability.
+- `StreamingCsvWriterAndExtractorTest` — Streams real H2 JDBC `ResultSet` rows (including JDBC 4.2 `java.time` `DATE`/`TIME`/`TIMESTAMP` columns) and mocked `STORED_PROCEDURE` `SYS_REFCURSOR` cursors to timestamped CSV, verifies quoting/pipes/`BigDecimal`/nulls, CSV formula injection neutralization (cells, headers, leading whitespace/newlines), bounded `CLOB`/`SQLXML` & `BLOB` resource freeing, `write-empty-file` true/false behavior, mid-stream `.part` cleanup, trailing `;` stripping, oversized/blank SQL rejection, null-cursor rejection, and JDBC statement cleanup on bind/fetch failures.
+- `AtomicSftpUploaderIntegrationTest` — Spins up a real embedded Apache MINA SFTP server to verify SSH private-key auth, password auth + credential zeroing, strict `0600` key/`known_hosts` permission checks, atomic `.tmp` → `.csv` rename, strict `known_hosts` rejection, exponential backoff retry with bulkhead release during sleep, bulkhead saturation timeout, SSH disconnect-code fast-fail, remote path normalization, partial `.tmp` cleanup on mid-stream failure, and cyclic exception cause / control-char sanitization.
+- `BackupRetentionServiceTest` — Verifies atomic archiving into `backup/yyyy-MM-dd/`, symlink rejection (staging files, backup root, date folders, and expired folder entries), orphan `.part` staging cleanup, deletion of files/folders and loose backup files older than 15 days, non-date folder preservation, missing-dir no-op safety, retention of the exact 15-day boundary, and pruning of stale empty folders.
+- `DynamicJobSchedulerAndOrchestratorTest` — Verifies enabled-only dynamic cron registration, end-to-end orchestration, `SKIPPED_EMPTY` and per-job `ReentrantLock` `SKIPPED_CONCURRENT` guards, staging retention & zero duplicate upload on failure, Oracle `SQLException` redaction (`vendorCode`/`sqlState`), `MDC` cleanup, and `ExportJobOrchestrator.getLastResults()` state tracking across failures and recovery.
 
 *(Note: `maven-surefire-plugin` passes `-Xshare:off -javaagent:...byte-buddy-agent...` solely during `mvn test` to prevent Java 21 JEP 451 dynamic agent warnings from Mockito; it has zero effect on the production JAR.)*
 
@@ -524,7 +524,7 @@ mvn clean package
 ## Observability, Failure Recovery & Horizontal Scaling
 
 - **Structured MDC Logging:** Every log line during a job run includes `[job=<jobName> run=<runId>]` for instant log aggregation in Splunk/ELK/Datadog. JDBC and SSHD loggers are set to `WARN` so SQL parameters and row values are never emitted.
-- **Actuator Health (`exportJobs`):** `ExportJobsHealthIndicator` reports `configuredJobs`, `enabledJobs`, and `lastRuns` (status, row count, filename, timestamp, duration). If any job's latest run fails, health flips to `DOWN` until its next successful run. *(Add `spring-boot-starter-webmvc` only if you want `/actuator/health` exposed over HTTP instead of JMX.)*
+- **In-Memory Run History (`ExportJobOrchestrator.getLastResults()`):** Tracks each job's latest immutable `JobExecutionResult` (status, row count, filename, remote path, timestamp, duration, sanitized error).
 - **Failure Recovery:**
   - If Oracle extraction fails, partial `.part` files are deleted automatically.
   - If SFTP upload fails permanently after all retries, the complete staged `.csv` is **retained in `staging/`** and its filename is logged so operators can inspect or manually deliver it without re-running heavy Oracle extracts.

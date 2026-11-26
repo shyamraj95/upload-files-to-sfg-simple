@@ -27,7 +27,7 @@ public class SchedulerConfiguration {
 
     @Bean
     public ThreadPoolTaskScheduler exportTaskScheduler(AppProperties properties) {
-        AppProperties.SchedulerConfig cfg = properties.getScheduler();
+        AppProperties.SchedulerConfig cfg = properties.scheduler();
 
         // Do NOT call scheduler.initialize() manually here: Spring calls InitializingBean.afterPropertiesSet()
         // once on @Bean creation. Overriding createExecutor() ensures shutdown policies are applied to the
@@ -51,17 +51,17 @@ public class SchedulerConfiguration {
             }
         };
 
-        scheduler.setPoolSize(cfg.getPoolSize());
-        scheduler.setThreadNamePrefix(cfg.getThreadNamePrefix());
+        scheduler.setPoolSize(cfg.poolSize());
+        scheduler.setThreadNamePrefix(cfg.threadNamePrefix());
         scheduler.setWaitForTasksToCompleteOnShutdown(true);
-        scheduler.setAwaitTerminationSeconds(cfg.getAwaitTerminationSeconds());
+        scheduler.setAwaitTerminationSeconds(cfg.awaitTerminationSeconds());
         // Immediately purge cancelled tasks from the work queue to avoid retaining references
         scheduler.setRemoveOnCancelPolicy(true);
         scheduler.setErrorHandler(ex ->
                 log.error("Unhandled exception in scheduled task thread: {}", ex.getMessage(), ex));
 
         log.info("Configured ThreadPoolTaskScheduler with poolSize={} and prefix='{}'",
-                cfg.getPoolSize(), cfg.getThreadNamePrefix());
+                cfg.poolSize(), cfg.threadNamePrefix());
         return scheduler;
     }
 }

@@ -1,51 +1,66 @@
 package com.enterprise.sfgexporter.model;
 
+import org.springframework.boot.context.properties.bind.DefaultValue;
+
 /**
  * Capped exponential backoff retry configuration applied to transient SFTP upload errors.
+ *
+ * @param maxAttempts      Total number of upload attempts including the initial try (must be &gt;= 1).
+ * @param initialBackoffMs Initial delay in milliseconds before the first retry (jittered by +/-15%).
+ * @param multiplier       Exponential backoff multiplier applied after each failed attempt (must be &gt;= 1.0).
+ * @param maxBackoffMs     Upper bound in milliseconds for any single retry sleep interval.
  */
-public class RetryConfig {
+public record RetryConfig(
+        @DefaultValue("3") int maxAttempts,
+        @DefaultValue("2000") long initialBackoffMs,
+        @DefaultValue("2.0") double multiplier,
+        @DefaultValue("30000") long maxBackoffMs
+) {
 
-    /** Total number of upload attempts including the initial try (must be &gt;= 1). */
-    private int maxAttempts = 3;
-
-    /** Initial delay in milliseconds before the first retry (jittered by +/-15%). */
-    private long initialBackoffMs = 2_000L;
-
-    /** Exponential backoff multiplier applied after each failed attempt (must be &gt;= 1.0). */
-    private double multiplier = 2.0;
-
-    /** Upper bound in milliseconds for any single retry sleep interval. */
-    private long maxBackoffMs = 30_000L;
-
-    public int getMaxAttempts() {
-        return maxAttempts;
+    public static RetryConfig defaults() {
+        return builder().build();
     }
 
-    public void setMaxAttempts(int maxAttempts) {
-        this.maxAttempts = maxAttempts;
+    public static Builder builder() {
+        return new Builder();
     }
 
-    public long getInitialBackoffMs() {
-        return initialBackoffMs;
+    public Builder toBuilder() {
+        return new Builder()
+                .maxAttempts(maxAttempts)
+                .initialBackoffMs(initialBackoffMs)
+                .multiplier(multiplier)
+                .maxBackoffMs(maxBackoffMs);
     }
 
-    public void setInitialBackoffMs(long initialBackoffMs) {
-        this.initialBackoffMs = initialBackoffMs;
-    }
+    public static final class Builder {
+        private int maxAttempts = 3;
+        private long initialBackoffMs = 2_000L;
+        private double multiplier = 2.0;
+        private long maxBackoffMs = 30_000L;
 
-    public double getMultiplier() {
-        return multiplier;
-    }
+        public Builder maxAttempts(int maxAttempts) {
+            this.maxAttempts = maxAttempts;
+            return this;
+        }
 
-    public void setMultiplier(double multiplier) {
-        this.multiplier = multiplier;
-    }
+        public Builder initialBackoffMs(long initialBackoffMs) {
+            this.initialBackoffMs = initialBackoffMs;
+            return this;
+        }
 
-    public long getMaxBackoffMs() {
-        return maxBackoffMs;
-    }
+        public Builder multiplier(double multiplier) {
+            this.multiplier = multiplier;
+            return this;
+        }
 
-    public void setMaxBackoffMs(long maxBackoffMs) {
-        this.maxBackoffMs = maxBackoffMs;
+        public Builder maxBackoffMs(long maxBackoffMs) {
+            this.maxBackoffMs = maxBackoffMs;
+            return this;
+        }
+
+        public RetryConfig build() {
+            return new RetryConfig(maxAttempts, initialBackoffMs, multiplier, maxBackoffMs);
+        }
     }
 }

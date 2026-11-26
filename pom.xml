@@ -35,19 +35,6 @@
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
 
-        <!-- Basic operational health monitoring (no web controllers) -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-
-        <!-- Compile-time only: resolves @JsonInclude referenced by spring-boot-health without adding Jackson at runtime -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-annotations</artifactId>
-            <scope>provided</scope>
-        </dependency>
-
         <!-- Oracle JDBC driver for Java 11+ / Java 21 -->
         <dependency>
             <groupId>com.oracle.database.jdbc</groupId>

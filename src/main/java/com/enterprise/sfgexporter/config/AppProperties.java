@@ -3,200 +3,254 @@ package com.enterprise.sfgexporter.config;
 import com.enterprise.sfgexporter.model.ExportJobConfig;
 import com.enterprise.sfgexporter.model.SftpTargetConfig;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Root configuration properties bound from the {@code app.*} namespace in {@code application.yml}.
+ * Immutable root configuration properties record bound from the {@code app.*} namespace in {@code application.yml}.
  *
- * <p>Field-level Javadocs in this class and its nested types are compiled by
+ * <p>Component Javadocs in this record and its nested records are compiled by
  * {@code spring-boot-configuration-processor} into {@code META-INF/spring-configuration-metadata.json}
  * so IDEs provide inline documentation and validation when editing YAML pipelines.</p>
+ *
+ * @param storage                   Local filesystem paths and retention cleanup schedule for staging and backup CSVs.
+ * @param scheduler                 Dedicated worker thread pool sizing and graceful shutdown configuration.
+ * @param sftpTargets               Named IBM SFG SFTP target definitions referenced by {@code app.jobs[].sftp-target}.
+ * @param jobs                      Declarative list of independent Oracle-to-SFG export pipelines.
+ * @param allowInsecureSftpDevMode  Explicit opt-in required before any SFTP target may set {@code strict-host-key-checking: false}.
  */
 @ConfigurationProperties(prefix = "app")
-public class AppProperties {
+public record AppProperties(
+        @DefaultValue StorageConfig storage,
+        @DefaultValue SchedulerConfig scheduler,
+        Map<String, SftpTargetConfig> sftpTargets,
+        List<ExportJobConfig> jobs,
+        @DefaultValue("false") boolean allowInsecureSftpDevMode
+) {
 
-    /** Local filesystem paths and retention cleanup schedule for staging and backup CSVs. */
-    private StorageConfig storage = new StorageConfig();
-
-    /** Dedicated worker thread pool sizing and graceful shutdown configuration. */
-    private SchedulerConfig scheduler = new SchedulerConfig();
-
-    /** Named IBM SFG SFTP target definitions referenced by {@code app.jobs[].sftp-target}. */
-    private Map<String, SftpTargetConfig> sftpTargets = new LinkedHashMap<>();
-
-    /** Declarative list of independent Oracle-to-SFG export pipelines. */
-    private List<ExportJobConfig> jobs = new ArrayList<>();
-
-    /**
-     * Explicit opt-in required before any SFTP target may set {@code strict-host-key-checking: false}.
-     * Must remain {@code false} in production to prevent accidental MITM exposure.
-     */
-    private boolean allowInsecureSftpDevMode = false;
-
-    public StorageConfig getStorage() {
-        return storage;
+    public AppProperties {
+        storage = storage != null ? storage : StorageConfig.defaults();
+        scheduler = scheduler != null ? scheduler : SchedulerConfig.defaults();
+        sftpTargets = sftpTargets == null
+                ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(sftpTargets));
+        jobs = jobs == null
+                ? List.of()
+                : Collections.unmodifiableList(new ArrayList<>(jobs));
     }
 
-    public void setStorage(StorageConfig storage) {
-        this.storage = storage != null ? storage : new StorageConfig();
+    public static AppProperties defaults() {
+        return builder().build();
     }
 
-    public SchedulerConfig getScheduler() {
-        return scheduler;
+    public static Builder builder() {
+        return new Builder();
     }
 
-    public void setScheduler(SchedulerConfig scheduler) {
-        this.scheduler = scheduler != null ? scheduler : new SchedulerConfig();
+    public Builder toBuilder() {
+        return new Builder()
+                .storage(storage)
+                .scheduler(scheduler)
+                .sftpTargets(sftpTargets)
+                .jobs(jobs)
+                .allowInsecureSftpDevMode(allowInsecureSftpDevMode);
     }
 
-    public Map<String, SftpTargetConfig> getSftpTargets() {
-        return sftpTargets;
-    }
+    public static final class Builder {
+        private StorageConfig storage = StorageConfig.defaults();
+        private SchedulerConfig scheduler = SchedulerConfig.defaults();
+        private Map<String, SftpTargetConfig> sftpTargets = new LinkedHashMap<>();
+        private List<ExportJobConfig> jobs = new ArrayList<>();
+        private boolean allowInsecureSftpDevMode = false;
 
-    public void setSftpTargets(Map<String, SftpTargetConfig> sftpTargets) {
-        this.sftpTargets = sftpTargets != null ? sftpTargets : new LinkedHashMap<>();
-    }
+        public Builder storage(StorageConfig storage) {
+            this.storage = storage;
+            return this;
+        }
 
-    public List<ExportJobConfig> getJobs() {
-        return jobs;
-    }
+        public Builder scheduler(SchedulerConfig scheduler) {
+            this.scheduler = scheduler;
+            return this;
+        }
 
-    public void setJobs(List<ExportJobConfig> jobs) {
-        this.jobs = jobs != null ? jobs : new ArrayList<>();
-    }
+        public Builder sftpTargets(Map<String, SftpTargetConfig> sftpTargets) {
+            this.sftpTargets = sftpTargets != null ? new LinkedHashMap<>(sftpTargets) : new LinkedHashMap<>();
+            return this;
+        }
 
-    public boolean isAllowInsecureSftpDevMode() {
-        return allowInsecureSftpDevMode;
-    }
+        public Builder jobs(List<ExportJobConfig> jobs) {
+            this.jobs = jobs != null ? new ArrayList<>(jobs) : new ArrayList<>();
+            return this;
+        }
 
-    public void setAllowInsecureSftpDevMode(boolean allowInsecureSftpDevMode) {
-        this.allowInsecureSftpDevMode = allowInsecureSftpDevMode;
+        public Builder allowInsecureSftpDevMode(boolean allowInsecureSftpDevMode) {
+            this.allowInsecureSftpDevMode = allowInsecureSftpDevMode;
+            return this;
+        }
+
+        public AppProperties build() {
+            return new AppProperties(storage, scheduler, sftpTargets, jobs, allowInsecureSftpDevMode);
+        }
     }
 
     /**
      * Local filesystem directories and automated retention cleanup settings.
+     *
+     * @param stagingDir             Directory where CSV files are streamed before SFTP upload.
+     * @param backupDir              Root archive directory containing {@code yyyy-MM-dd/} folders of uploaded CSVs.
+     * @param sqlDir                 Optional allowlisted base directory confining external {@code file:} SQL resources.
+     * @param retentionDays          Number of days to retain local backup CSVs (and failed staged CSVs) before deletion.
+     * @param stagingPartMaxAgeHours Age in hours after which crash-orphaned {@code .part} files in {@code staging/} are purged.
+     * @param cleanupCron            Spring 6-field cron expression for the daily backup cleanup sweep.
+     * @param cleanupTimeZone        IANA time zone ID used to evaluate {@code cleanupCron} and backup date folders.
      */
-    public static class StorageConfig {
-        /** Directory where CSV files are streamed before SFTP upload. */
-        private String stagingDir = "./data/staging";
+    public record StorageConfig(
+            @DefaultValue("./data/staging") String stagingDir,
+            @DefaultValue("./data/backup") String backupDir,
+            @DefaultValue("") String sqlDir,
+            @DefaultValue("15") int retentionDays,
+            @DefaultValue("24") int stagingPartMaxAgeHours,
+            @DefaultValue("0 0 2 * * *") String cleanupCron,
+            @DefaultValue("UTC") String cleanupTimeZone
+    ) {
 
-        /** Root archive directory containing {@code yyyy-MM-dd/} folders of uploaded CSVs. */
-        private String backupDir = "./data/backup";
-
-        /**
-         * Optional allowlisted base directory confining external {@code file:} SQL resources.
-         * When set, all {@code file:} SQL paths must resolve strictly inside this directory.
-         */
-        private String sqlDir = "";
-
-        /** Number of days to retain local backup CSVs (and failed staged CSVs) before automated deletion (default: 15). */
-        private int retentionDays = 15;
-
-        /** Age in hours after which crash-orphaned {@code .part} files in {@code staging/} are purged (default: 24). */
-        private int stagingPartMaxAgeHours = 24;
-
-        /** Spring 6-field cron expression for the daily backup cleanup sweep. */
-        private String cleanupCron = "0 0 2 * * *";
-
-        /** IANA time zone ID used to evaluate {@code cleanupCron} and backup date folders. */
-        private String cleanupTimeZone = "UTC";
-
-        public String getStagingDir() {
-            return stagingDir;
+        public StorageConfig {
+            sqlDir = sqlDir != null ? sqlDir : "";
         }
 
-        public void setStagingDir(String stagingDir) {
-            this.stagingDir = stagingDir;
+        public static StorageConfig defaults() {
+            return builder().build();
         }
 
-        public String getBackupDir() {
-            return backupDir;
+        public static Builder builder() {
+            return new Builder();
         }
 
-        public void setBackupDir(String backupDir) {
-            this.backupDir = backupDir;
+        public Builder toBuilder() {
+            return new Builder()
+                    .stagingDir(stagingDir)
+                    .backupDir(backupDir)
+                    .sqlDir(sqlDir)
+                    .retentionDays(retentionDays)
+                    .stagingPartMaxAgeHours(stagingPartMaxAgeHours)
+                    .cleanupCron(cleanupCron)
+                    .cleanupTimeZone(cleanupTimeZone);
         }
 
-        public String getSqlDir() {
-            return sqlDir;
-        }
+        public static final class Builder {
+            private String stagingDir = "./data/staging";
+            private String backupDir = "./data/backup";
+            private String sqlDir = "";
+            private int retentionDays = 15;
+            private int stagingPartMaxAgeHours = 24;
+            private String cleanupCron = "0 0 2 * * *";
+            private String cleanupTimeZone = "UTC";
 
-        public void setSqlDir(String sqlDir) {
-            this.sqlDir = sqlDir;
-        }
+            public Builder stagingDir(String stagingDir) {
+                this.stagingDir = stagingDir;
+                return this;
+            }
 
-        public int getRetentionDays() {
-            return retentionDays;
-        }
+            public Builder backupDir(String backupDir) {
+                this.backupDir = backupDir;
+                return this;
+            }
 
-        public void setRetentionDays(int retentionDays) {
-            this.retentionDays = retentionDays;
-        }
+            public Builder sqlDir(String sqlDir) {
+                this.sqlDir = sqlDir;
+                return this;
+            }
 
-        public int getStagingPartMaxAgeHours() {
-            return stagingPartMaxAgeHours;
-        }
+            public Builder retentionDays(int retentionDays) {
+                this.retentionDays = retentionDays;
+                return this;
+            }
 
-        public void setStagingPartMaxAgeHours(int stagingPartMaxAgeHours) {
-            this.stagingPartMaxAgeHours = stagingPartMaxAgeHours;
-        }
+            public Builder stagingPartMaxAgeHours(int stagingPartMaxAgeHours) {
+                this.stagingPartMaxAgeHours = stagingPartMaxAgeHours;
+                return this;
+            }
 
-        public String getCleanupCron() {
-            return cleanupCron;
-        }
+            public Builder cleanupCron(String cleanupCron) {
+                this.cleanupCron = cleanupCron;
+                return this;
+            }
 
-        public void setCleanupCron(String cleanupCron) {
-            this.cleanupCron = cleanupCron;
-        }
+            public Builder cleanupTimeZone(String cleanupTimeZone) {
+                this.cleanupTimeZone = cleanupTimeZone;
+                return this;
+            }
 
-        public String getCleanupTimeZone() {
-            return cleanupTimeZone;
-        }
-
-        public void setCleanupTimeZone(String cleanupTimeZone) {
-            this.cleanupTimeZone = cleanupTimeZone;
+            public StorageConfig build() {
+                return new StorageConfig(
+                        stagingDir,
+                        backupDir,
+                        sqlDir,
+                        retentionDays,
+                        stagingPartMaxAgeHours,
+                        cleanupCron,
+                        cleanupTimeZone
+                );
+            }
         }
     }
 
     /**
      * Thread pool configuration for Spring's {@code ThreadPoolTaskScheduler}.
+     *
+     * @param poolSize                Maximum number of export/cleanup jobs that may execute concurrently on this node.
+     * @param threadNamePrefix        Thread name prefix used in logs and thread dumps for scheduled worker threads.
+     * @param awaitTerminationSeconds Maximum seconds to wait for in-flight jobs to finish during graceful shutdown.
      */
-    public static class SchedulerConfig {
-        /** Maximum number of export/cleanup jobs that may execute concurrently on this node. */
-        private int poolSize = 4;
+    public record SchedulerConfig(
+            @DefaultValue("4") int poolSize,
+            @DefaultValue("sfg-job-") String threadNamePrefix,
+            @DefaultValue("60") int awaitTerminationSeconds
+    ) {
 
-        /** Thread name prefix used in logs and thread dumps for scheduled worker threads. */
-        private String threadNamePrefix = "sfg-job-";
-
-        /** Maximum seconds to wait for in-flight jobs to finish during graceful shutdown. */
-        private int awaitTerminationSeconds = 60;
-
-        public int getPoolSize() {
-            return poolSize;
+        public static SchedulerConfig defaults() {
+            return builder().build();
         }
 
-        public void setPoolSize(int poolSize) {
-            this.poolSize = poolSize;
+        public static Builder builder() {
+            return new Builder();
         }
 
-        public String getThreadNamePrefix() {
-            return threadNamePrefix;
+        public Builder toBuilder() {
+            return new Builder()
+                    .poolSize(poolSize)
+                    .threadNamePrefix(threadNamePrefix)
+                    .awaitTerminationSeconds(awaitTerminationSeconds);
         }
 
-        public void setThreadNamePrefix(String threadNamePrefix) {
-            this.threadNamePrefix = threadNamePrefix;
-        }
+        public static final class Builder {
+            private int poolSize = 4;
+            private String threadNamePrefix = "sfg-job-";
+            private int awaitTerminationSeconds = 60;
 
-        public int getAwaitTerminationSeconds() {
-            return awaitTerminationSeconds;
-        }
+            public Builder poolSize(int poolSize) {
+                this.poolSize = poolSize;
+                return this;
+            }
 
-        public void setAwaitTerminationSeconds(int awaitTerminationSeconds) {
-            this.awaitTerminationSeconds = awaitTerminationSeconds;
+            public Builder threadNamePrefix(String threadNamePrefix) {
+                this.threadNamePrefix = threadNamePrefix;
+                return this;
+            }
+
+            public Builder awaitTerminationSeconds(int awaitTerminationSeconds) {
+                this.awaitTerminationSeconds = awaitTerminationSeconds;
+                return this;
+            }
+
+            public SchedulerConfig build() {
+                return new SchedulerConfig(poolSize, threadNamePrefix, awaitTerminationSeconds);
+            }
         }
     }
 }

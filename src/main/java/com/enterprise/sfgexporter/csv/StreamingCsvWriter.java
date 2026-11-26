@@ -1,20 +1,7 @@
 package com.enterprise.sfgexporter.csv;
 
-import com.enterprise.sfgexporter.config.AppProperties;
-import com.enterprise.sfgexporter.config.SecurityValidator;
-import com.enterprise.sfgexporter.model.CsvOptions;
-import com.enterprise.sfgexporter.model.ExportJobConfig;
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVPrinter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
-
 import java.io.BufferedWriter;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.nio.channels.Channels;
@@ -35,26 +22,49 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLXML;
+import java.sql.Types;
 import java.time.Clock;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.Temporal;
-import java.util.Date;
 import java.util.Set;
 import java.util.UUID;
+
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import com.enterprise.sfgexporter.config.AppProperties;
+import com.enterprise.sfgexporter.config.SecurityValidator;
+import com.enterprise.sfgexporter.model.CsvOptions;
+import com.enterprise.sfgexporter.model.ExportJobConfig;
 
 /**
  * Streams JDBC {@link ResultSet} rows directly to disk using Apache Commons CSV
  * so heap memory remains flat O(1) regardless of dataset size.
  *
- * <p>Key design guarantees:</p>
+ * <p>
+ * Key design guarantees:
+ * </p>
  * <ul>
- *     <li>Single 64 KB output buffer and a reused per-row {@code Object[]} buffer minimize GC pressure.</li>
- *     <li>Writes to a temporary {@code .part} file in {@code staging/} and atomically promotes it to
- *         {@code .csv} upon completion; deletes {@code .part} on any error.</li>
- *     <li>Restricts POSIX permissions to {@code 0700} (staging dir) and {@code 0600} (staged CSV).</li>
- *     <li>Explicitly frees Oracle temporary {@link Clob} handles and never logs row or cell payloads.</li>
+ * <li>Single 64 KB output buffer and a reused per-row {@code Object[]} buffer
+ * minimize GC pressure.</li>
+ * <li>Writes to a temporary {@code .part} file in {@code staging/} and
+ * atomically promotes it to
+ * {@code .csv} upon completion; deletes {@code .part} on any error.</li>
+ * <li>Restricts POSIX permissions to {@code 0700} (staging dir) and
+ * {@code 0600} (staged CSV).</li>
+ * <li>Explicitly frees Oracle temporary {@link Clob} handles and never logs row
+ * or cell payloads.</li>
  * </ul>
  */
 @Component
@@ -71,7 +81,7 @@ public class StreamingCsvWriter {
 
     @Autowired
     public StreamingCsvWriter(AppProperties properties) {
-        this(Path.of(properties.getStorage().getStagingDir()), Clock.systemUTC());
+        this(Path.of(properties.storage().stagingDir()), Clock.systemUTC());
     }
 
     public StreamingCsvWriter(Path stagingDir, Clock clock) {
@@ -80,11 +90,13 @@ public class StreamingCsvWriter {
     }
 
     /**
-     * Streams all rows from {@code resultSet} into a timestamped CSV file inside the staging directory.
-     * Writes to a local {@code .part} file first and atomically promotes it to {@code .csv} upon completion.
+     * Streams all rows from {@code resultSet} into a timestamped CSV file inside
+     * the staging directory.
+     * Writes to a local {@code .part} file first and atomically promotes it to
+     * {@code .csv} upon completion.
      */
     public StagedCsvFile writeResultSet(ResultSet resultSet, ExportJobConfig job) throws SQLException, IOException {
-        SecurityValidator.validateIdentifier(job.getFilePrefix(), "filePrefix");
+        SecurityValidator.validateIdentifier(job.filePrefix(), "filePrefix");
         ensureStagingDirectory();
 
         String finalFileName = buildTimestampedFileName(job);
@@ -92,34 +104,41 @@ public class StreamingCsvWriter {
         String uniquePartName = finalFileName + "." + UUID.randomUUID().toString().substring(0, 8) + LOCAL_PART_SUFFIX;
         Path partPath = SecurityValidator.ensureChildPath(stagingDir, stagingDir.resolve(uniquePartName));
 
-        CsvOptions csvOptions = job.getCsv();
+        CsvOptions csvOptions = job.csv();
         Charset charset = csvOptions.resolveCharset();
         CSVFormat format = buildCsvFormat(csvOptions);
 
         long rowCount = 0L;
         boolean finalized = false;
         try {
-            try (OutputStream out = openRestrictedOutputStream(partPath);
-                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(out, charset), WRITE_BUFFER_BYTES);
-                 CSVPrinter printer = new CSVPrinter(writer, format)) {
+            try (SeekableByteChannel channel = openRestrictedChannel(partPath);
+                    BufferedWriter writer = new BufferedWriter(Channels.newWriter(channel, charset),
+                            WRITE_BUFFER_BYTES);
+                    CSVPrinter printer = new CSVPrinter(writer, format)) {
 
                 ResultSetMetaData metaData = resultSet.getMetaData();
                 int columnCount = metaData.getColumnCount();
+                int[] columnTypes = new int[columnCount];
+                for (int i = 1; i <= columnCount; i++) {
+                    columnTypes[i - 1] = metaData.getColumnType(i);
+                }
 
-                if (csvOptions.isIncludeHeader() && columnCount > 0) {
+                if (csvOptions.includeHeader() && columnCount > 0) {
                     String[] headers = new String[columnCount];
                     for (int i = 1; i <= columnCount; i++) {
                         headers[i - 1] = neutralizeFormulaIfNeeded(
-                                metaData.getColumnLabel(i), csvOptions.isNeutralizeFormulas());
+                                metaData.getColumnLabel(i), csvOptions.neutralizeFormulas());
                     }
                     printer.printRecord((Object[]) headers);
                 }
 
-                // Reuse a single row array across iterations to minimize GC pressure on large exports
+                // Reuse a single row array across iterations to minimize GC pressure on large
+                // exports
                 Object[] rowBuffer = new Object[columnCount];
                 while (resultSet.next()) {
                     for (int i = 1; i <= columnCount; i++) {
-                        rowBuffer[i - 1] = normalizeColumnValue(resultSet.getObject(i), csvOptions);
+                        rowBuffer[i - 1] = normalizeColumnValue(
+                                readColumnValue(resultSet, i, columnTypes[i - 1]), csvOptions);
                     }
                     printer.printRecord(rowBuffer);
                     rowCount++;
@@ -127,16 +146,16 @@ public class StreamingCsvWriter {
                 printer.flush();
             }
 
-            if (rowCount == 0 && !csvOptions.isWriteEmptyFile()) {
+            if (rowCount == 0 && !csvOptions.writeEmptyFile()) {
                 Files.deleteIfExists(partPath);
                 finalized = true;
-                log.info("Job '{}' produced 0 rows and write-empty-file=false; skipping CSV creation", job.getName());
+                log.info("Job '{}' produced 0 rows and write-empty-file=false; skipping CSV creation", job.name());
                 return new StagedCsvFile(null, null, 0L);
             }
 
             promotePartFile(partPath, finalPath);
             finalized = true;
-            log.info("Generated staged CSV '{}' with {} row(s) for job '{}'", finalFileName, rowCount, job.getName());
+            log.info("Generated staged CSV '{}' with {} row(s) for job '{}'", finalFileName, rowCount, job.name());
             return new StagedCsvFile(finalPath, finalFileName, rowCount);
 
         } finally {
@@ -147,53 +166,66 @@ public class StreamingCsvWriter {
     }
 
     String buildTimestampedFileName(ExportJobConfig job) {
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(job.getTimestampPattern());
-        ZonedDateTime now = ZonedDateTime.now(clock).withZoneSameInstant(ZoneId.of(job.getTimeZone()));
-        return job.getFilePrefix() + "_" + formatter.format(now) + ".csv";
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(job.timestampPattern());
+        ZonedDateTime now = ZonedDateTime.now(clock).withZoneSameInstant(ZoneId.of(job.timeZone()));
+        return job.filePrefix() + "_" + formatter.format(now) + ".csv";
     }
 
     private CSVFormat buildCsvFormat(CsvOptions options) {
         CSVFormat.Builder builder = CSVFormat.Builder.create(CSVFormat.DEFAULT)
-                .setDelimiter(options.getDelimiter().charAt(0))
-                .setRecordSeparator(options.getRecordSeparator())
-                .setNullString(options.getNullString());
+                .setDelimiter(options.delimiter().charAt(0))
+                .setRecordSeparator(options.recordSeparator())
+                .setNullString(options.nullString());
 
-        if (options.getQuoteChar() == null || options.getQuoteChar().isEmpty()) {
+        if (options.quoteChar() == null || options.quoteChar().isEmpty()) {
             builder.setQuote((Character) null);
         } else {
-            builder.setQuote(options.getQuoteChar().charAt(0));
+            builder.setQuote(options.quoteChar().charAt(0));
         }
 
         return builder.get();
     }
 
+    private Object readColumnValue(ResultSet resultSet, int columnIndex, int sqlType) throws SQLException {
+        return switch (sqlType) {
+            case Types.DATE -> readTemporalColumn(resultSet, columnIndex, LocalDate.class);
+            case Types.TIME -> readTemporalColumn(resultSet, columnIndex, LocalTime.class);
+            case Types.TIME_WITH_TIMEZONE -> readTemporalColumn(resultSet, columnIndex, OffsetTime.class);
+            case Types.TIMESTAMP -> readTemporalColumn(resultSet, columnIndex, LocalDateTime.class);
+            case Types.TIMESTAMP_WITH_TIMEZONE -> readTemporalColumn(resultSet, columnIndex, OffsetDateTime.class);
+            default -> resultSet.getObject(columnIndex);
+        };
+    }
+
+    private <T extends Temporal> Object readTemporalColumn(
+            ResultSet resultSet, int columnIndex, Class<T> targetType) throws SQLException {
+        try {
+            return resultSet.getObject(columnIndex, targetType);
+        } catch (SQLFeatureNotSupportedException ignored) {
+            return resultSet.getObject(columnIndex);
+        }
+    }
+
     private Object normalizeColumnValue(Object value, CsvOptions csvOptions) throws SQLException {
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof BigDecimal decimal) {
-            // Avoid scientific notation for financial amounts and numeric identifiers; negative numbers stay numeric
-            return decimal.toPlainString();
-        }
-        if (value instanceof Number || value instanceof Boolean || value instanceof Temporal || value instanceof Date) {
-            return value;
-        }
-        if (value instanceof Clob clob) {
-            String text = readClobBounded(clob, csvOptions.getMaxClobChars());
-            return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
-        }
-        if (value instanceof SQLXML sqlxml) {
-            String text = readSqlXmlBounded(sqlxml, csvOptions.getMaxClobChars());
-            return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
-        }
-        if (value instanceof Blob blob) {
-            freeBlobQuietly(blob);
-            throw new SQLException("Unsupported BLOB column in CSV export");
-        }
-        if (value instanceof String text) {
-            return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
-        }
-        return neutralizeFormulaIfNeeded(value.toString(), csvOptions.isNeutralizeFormulas());
+        return switch (value) {
+            case null -> null;
+            // Avoid scientific notation for financial amounts and numeric identifiers;
+            // negative numbers stay numeric
+            case BigDecimal decimal -> decimal.toPlainString();
+            case Number n -> n;
+            case Boolean b -> b;
+            case Temporal t -> t;
+            case Clob clob -> neutralizeFormulaIfNeeded(
+                    readClobBounded(clob, csvOptions.maxClobChars()), csvOptions.neutralizeFormulas());
+            case SQLXML sqlxml -> neutralizeFormulaIfNeeded(
+                    readSqlXmlBounded(sqlxml, csvOptions.maxClobChars()), csvOptions.neutralizeFormulas());
+            case Blob blob -> {
+                freeBlobQuietly(blob);
+                throw new SQLException("Unsupported BLOB column in CSV export");
+            }
+            case String text -> neutralizeFormulaIfNeeded(text, csvOptions.neutralizeFormulas());
+            default -> neutralizeFormulaIfNeeded(value.toString(), csvOptions.neutralizeFormulas());
+        };
     }
 
     private String readClobBounded(Clob clob, int maxClobChars) throws SQLException {
@@ -217,7 +249,7 @@ public class StreamingCsvWriter {
                 return "";
             }
             StringBuilder sb = new StringBuilder();
-            char[] buf = new char[Math.min(4096, Math.max(1, maxChars))];
+            char[] buf = new char[Math.clamp(maxChars, 1, 4096)];
             int read;
             while ((read = reader.read(buf)) != -1) {
                 if (sb.length() + read > maxChars) {
@@ -243,28 +275,33 @@ public class StreamingCsvWriter {
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (!Character.isWhitespace(c)) {
-                if (c == '=' || c == '+' || c == '-' || c == '@') {
-                    return "'" + text;
-                }
-                break;
+                return isFormulaOperator(c) ? "'" + text : text;
             }
         }
         return text;
     }
 
-    private boolean isFormulaTrigger(char c) {
-        return c == '=' || c == '+' || c == '-' || c == '@' || c == '\t' || c == '\r' || c == '\n';
+    private boolean isFormulaOperator(char c) {
+        return switch (c) {
+            case '=', '+', '-', '@' -> true;
+            default -> false;
+        };
     }
 
-    private OutputStream openRestrictedOutputStream(Path partPath) throws IOException {
+    private boolean isFormulaTrigger(char c) {
+        return switch (c) {
+            case '=', '+', '-', '@', '\t', '\r', '\n' -> true;
+            default -> false;
+        };
+    }
+
+    private SeekableByteChannel openRestrictedChannel(Path partPath) throws IOException {
         Set<StandardOpenOption> options = Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
-        SeekableByteChannel channel;
         try {
-            channel = Files.newByteChannel(partPath, options, PosixFilePermissions.asFileAttribute(RESTRICTED_FILE_PERMS));
+            return Files.newByteChannel(partPath, options, PosixFilePermissions.asFileAttribute(RESTRICTED_FILE_PERMS));
         } catch (UnsupportedOperationException ignored) {
-            channel = Files.newByteChannel(partPath, options);
+            return Files.newByteChannel(partPath, options);
         }
-        return Channels.newOutputStream(channel);
     }
 
     private void freeClobQuietly(Clob clob) {

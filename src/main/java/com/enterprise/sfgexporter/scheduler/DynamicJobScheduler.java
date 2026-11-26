@@ -43,18 +43,18 @@ public class DynamicJobScheduler implements SchedulingConfigurer {
         taskRegistrar.setTaskScheduler(exportTaskScheduler);
 
         int registeredCount = 0;
-        for (ExportJobConfig job : properties.getJobs()) {
-            if (!job.isEnabled()) {
-                log.info("Export job '{}' is disabled in configuration; skipping registration", job.getName());
+        for (ExportJobConfig job : properties.jobs()) {
+            if (!job.enabled()) {
+                log.info("Export job '{}' is disabled in configuration; skipping registration", job.name());
                 continue;
             }
 
-            CronTrigger trigger = new CronTrigger(job.getCron(), ZoneId.of(job.getTimeZone()));
+            CronTrigger trigger = new CronTrigger(job.cron(), ZoneId.of(job.timeZone()));
             taskRegistrar.addTriggerTask(() -> orchestrator.executeJob(job), trigger);
             registeredCount++;
 
             log.info("Registered scheduled export job '{}' with cron='{}' (zone='{}', target='{}')",
-                    job.getName(), job.getCron(), job.getTimeZone(), job.getSftpTarget());
+                    job.name(), job.cron(), job.timeZone(), job.sftpTarget());
         }
 
         if (registeredCount == 0) {

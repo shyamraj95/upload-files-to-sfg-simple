@@ -2,6 +2,7 @@ package com.enterprise.sfgexporter.model;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 
 /**
  * Immutable summary of a single export job execution.
@@ -33,6 +34,14 @@ public record JobExecutionResult(
         Duration duration,
         String errorMessage
 ) {
+
+    public JobExecutionResult {
+        Objects.requireNonNull(jobName, "jobName must not be null");
+        Objects.requireNonNull(runId, "runId must not be null");
+        Objects.requireNonNull(status, "status must not be null");
+        Objects.requireNonNull(startedAt, "startedAt must not be null");
+        Objects.requireNonNull(duration, "duration must not be null");
+    }
 
     /** Terminal outcome of a scheduled job invocation. */
     public enum Status {

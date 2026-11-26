@@ -37,7 +37,7 @@ public class SftpSessionFactoryRegistry implements DisposableBean {
     }
 
     public SftpTargetConfig getTargetConfig(String targetKey) {
-        SftpTargetConfig config = properties.getSftpTargets().get(targetKey);
+        SftpTargetConfig config = properties.sftpTargets().get(targetKey);
         if (config == null) {
             throw new IllegalArgumentException("Unknown SFTP target: " + targetKey);
         }
@@ -50,26 +50,33 @@ public class SftpSessionFactoryRegistry implements DisposableBean {
 
     private ManagedTarget createManagedTarget(String targetKey, SftpTargetConfig config) {
         SshClient sshClient = sshClientFactory.createHardenedClient(targetKey, config);
+        boolean initialized = false;
         try {
             // Pass the externally hardened SshClient directly; auth & strict host-key verification
             // are enforced directly on sshClient as required by Spring Integration SFTP 6+/7+.
             DefaultSftpSessionFactory factory = new DefaultSftpSessionFactory(sshClient, false);
-            factory.setHost(config.getHost());
-            factory.setPort(config.getPort());
-            factory.setUser(config.getUsername());
-            factory.setTimeout((int) Math.min(config.getChannelOpenTimeoutMs(), Integer.MAX_VALUE));
+            factory.setHost(config.host());
+            factory.setPort(config.port());
+            factory.setUser(config.username());
+            factory.setTimeout(Math.clamp(config.channelOpenTimeoutMs(), 0, Integer.MAX_VALUE));
+            initialized = true;
             return new ManagedTarget(sshClient, factory);
-        } catch (Throwable ex) {
-            stopClientQuietly(sshClient);
-            throw ex;
+        } finally {
+            if (!initialized) {
+                stopClientQuietly(sshClient);
+            }
         }
     }
 
     @Override
     public void destroy() {
         for (ManagedTarget target : targets.values()) {
-            destroyFactoryQuietly(target.factory());
-            stopClientQuietly(target.client());
+            switch (target) {
+                case ManagedTarget(SshClient client, DefaultSftpSessionFactory factory) -> {
+                    destroyFactoryQuietly(factory);
+                    stopClientQuietly(client);
+                }
+            }
         }
         targets.clear();
         log.info("Stopped all managed SFTP SshClient instances");

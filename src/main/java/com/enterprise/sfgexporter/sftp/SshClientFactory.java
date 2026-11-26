@@ -57,15 +57,16 @@ public class SshClientFactory {
 
     public SshClient createHardenedClient(String targetKey, SftpTargetConfig config) {
         SshClient client = SshClient.setUpDefaultClient();
+        boolean initialized = false;
         try {
             // 1. Restrict ciphers, KEX, and MACs to configured modern strong algorithms
-            client.setCipherFactories(resolveCiphers(targetKey, config.getAllowedCiphers()));
-            client.setKeyExchangeFactories(resolveKeyExchanges(targetKey, config.getAllowedKeyExchanges()));
-            client.setMacFactories(resolveMacs(targetKey, config.getAllowedMacs()));
+            client.setCipherFactories(resolveCiphers(targetKey, config.allowedCiphers()));
+            client.setKeyExchangeFactories(resolveKeyExchanges(targetKey, config.allowedKeyExchanges()));
+            client.setMacFactories(resolveMacs(targetKey, config.allowedMacs()));
 
             // 2. Enforce strict host key verification via server-mounted known_hosts
-            if (config.isStrictHostKeyChecking()) {
-                Path knownHostsPath = Path.of(config.getKnownHostsPath()).toAbsolutePath().normalize();
+            if (config.strictHostKeyChecking()) {
+                Path knownHostsPath = Path.of(config.knownHostsPath()).toAbsolutePath().normalize();
                 if (Files.isSymbolicLink(knownHostsPath)
                         || !Files.isRegularFile(knownHostsPath, LinkOption.NOFOLLOW_LINKS)
                         || !Files.isReadable(knownHostsPath)) {
@@ -86,9 +87,9 @@ public class SshClientFactory {
             configureAuthentication(client, targetKey, config);
 
             // 4. Configure deterministic network, read, keepalive, and authentication timeouts
-            Duration ioTimeout = Duration.ofMillis(Math.max(config.getChannelOpenTimeoutMs() * 2L, 30_000L));
-            CoreModuleProperties.IO_CONNECT_TIMEOUT.set(client, Duration.ofMillis(config.getConnectTimeoutMs()));
-            CoreModuleProperties.AUTH_TIMEOUT.set(client, Duration.ofMillis(config.getAuthTimeoutMs()));
+            Duration ioTimeout = Duration.ofMillis(Math.max(config.channelOpenTimeoutMs() * 2L, 30_000L));
+            CoreModuleProperties.IO_CONNECT_TIMEOUT.set(client, Duration.ofMillis(config.connectTimeoutMs()));
+            CoreModuleProperties.AUTH_TIMEOUT.set(client, Duration.ofMillis(config.authTimeoutMs()));
             CoreModuleProperties.IDLE_TIMEOUT.set(client, ioTimeout);
             CoreModuleProperties.NIO2_READ_TIMEOUT.set(client, ioTimeout);
             CoreModuleProperties.SOCKET_KEEPALIVE.set(client, true);
@@ -97,11 +98,13 @@ public class SshClientFactory {
             // Release plaintext credential references from the config object once absorbed by SshClient
             config.clearSecrets();
             log.info("Started hardened SshClient for target '{}' (host={}:{}, strictHostKeyChecking={})",
-                    targetKey, config.getHost(), config.getPort(), config.isStrictHostKeyChecking());
+                    targetKey, config.host(), config.port(), config.strictHostKeyChecking());
+            initialized = true;
             return client;
-        } catch (Throwable ex) {
-            closeClientQuietly(client);
-            throw ex;
+        } finally {
+            if (!initialized) {
+                closeClientQuietly(client);
+            }
         }
     }
 
@@ -115,7 +118,7 @@ public class SshClientFactory {
 
     private void configureAuthentication(SshClient client, String targetKey, SftpTargetConfig config) {
         if (config.hasPrivateKeyAuth()) {
-            Path keyPath = Path.of(config.getPrivateKeyPath()).toAbsolutePath().normalize();
+            Path keyPath = Path.of(config.privateKeyPath()).toAbsolutePath().normalize();
             if (Files.isSymbolicLink(keyPath)
                     || !Files.isRegularFile(keyPath, LinkOption.NOFOLLOW_LINKS)
                     || !Files.isReadable(keyPath)) {
@@ -125,15 +128,16 @@ public class SshClientFactory {
             }
             enforcePrivateKeyPermissions(keyPath, targetKey);
             FileKeyPairProvider keyPairProvider = new FileKeyPairProvider(keyPath);
-            if (config.getPrivateKeyPassphrase() != null && !config.getPrivateKeyPassphrase().isEmpty()) {
-                keyPairProvider.setPasswordFinder(FilePasswordProvider.of(config.getPrivateKeyPassphrase()));
+            String passphrase = config.exposePrivateKeyPassphrase();
+            if (passphrase != null && !passphrase.isEmpty()) {
+                keyPairProvider.setPasswordFinder(FilePasswordProvider.of(passphrase));
             }
             client.setKeyIdentityProvider(keyPairProvider);
             log.info("Configured SSH private-key authentication for SFTP target '{}'", targetKey);
         } else if (config.hasPasswordAuth()) {
             // Prevent implicit fallback to ~/.ssh keys when password auth is explicitly selected
             client.setKeyIdentityProvider(KeyIdentityProvider.EMPTY_KEYS_PROVIDER);
-            client.addPasswordIdentity(config.getPassword());
+            client.addPasswordIdentity(config.exposePassword());
             log.info("Configured password authentication for SFTP target '{}'", targetKey);
         } else {
             throw new IllegalStateException("No authentication method configured for SFTP target '" + targetKey + "'");

@@ -74,65 +74,70 @@ public class AtomicSftpUploader {
 
         String fileName = Objects.requireNonNull(
                 localFile.getFileName(), "Local file path must include a file name").toString();
-        String finalRemotePath = buildRemotePath(targetConfig.getRemoteBaseDir(), jobRemoteDir, fileName);
-        String tempRemotePath = finalRemotePath + targetConfig.getTempSuffix();
+        String finalRemotePath = buildRemotePath(targetConfig.remoteBaseDir(), jobRemoteDir, fileName);
+        String tempRemotePath = finalRemotePath + targetConfig.tempSuffix();
 
         Semaphore bulkhead = targetBulkheads.computeIfAbsent(
-                targetKey, ignored -> new Semaphore(Math.max(1, targetConfig.getMaxConcurrentUploads())));
-        return executeWithRetry(
-                bulkhead, sessionFactory, localFile, targetKey, targetConfig, fileName, tempRemotePath, finalRemotePath);
+                targetKey, ignored -> new Semaphore(Math.max(1, targetConfig.maxConcurrentUploads())));
+        TransferPaths paths = new TransferPaths(localFile, fileName, tempRemotePath, finalRemotePath);
+        return executeWithRetry(bulkhead, sessionFactory, targetKey, targetConfig, paths);
     }
 
     private String executeWithRetry(
             Semaphore bulkhead,
             SessionFactory<SftpClient.DirEntry> sessionFactory,
-            Path localFile,
             String targetKey,
             SftpTargetConfig targetConfig,
-            String fileName,
-            String tempRemotePath,
-            String finalRemotePath
+            TransferPaths paths
     ) {
-        RetryConfig retry = targetConfig.getRetry();
-        int maxAttempts = Math.max(1, retry.getMaxAttempts());
-        long currentBackoffMs = retry.getInitialBackoffMs();
+        RetryConfig retry = targetConfig.retry();
+        int maxAttempts = Math.max(1, retry.maxAttempts());
+        long currentBackoffMs = retry.initialBackoffMs();
 
         Exception lastException = null;
         int attemptsExecuted = 0;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             attemptsExecuted = attempt;
-            acquireBulkhead(bulkhead, targetKey, targetConfig.getConnectTimeoutMs());
+            acquireBulkhead(bulkhead, targetKey, targetConfig.connectTimeoutMs());
             try {
-                try {
-                    executeAtomicTransfer(sessionFactory, localFile, tempRemotePath, finalRemotePath);
-                } finally {
-                    // Release concurrency permit immediately after transfer attempt, before retry backoff sleep
-                    bulkhead.release();
-                }
+                executeTransferWithBulkhead(bulkhead, sessionFactory, paths);
                 log.info("Atomically uploaded '{}' to SFG target '{}' at '{}' (attempt {}/{})",
-                        fileName, targetKey, finalRemotePath, attempt, maxAttempts);
-                return finalRemotePath;
+                        paths.fileName(), targetKey, paths.finalRemotePath(), attempt, maxAttempts);
+                return paths.finalRemotePath();
             } catch (IOException | RuntimeException ex) {
                 lastException = ex;
                 if (isNonRetryable(ex) || attempt == maxAttempts) {
                     log.error("SFTP upload failed permanently for '{}' to target '{}' on attempt {}/{}: {}",
-                            fileName, targetKey, attempt, maxAttempts, summarizeException(ex));
+                            paths.fileName(), targetKey, attempt, maxAttempts, summarizeException(ex));
                     break;
                 }
 
-                long sleepMs = computeJitteredBackoff(currentBackoffMs, retry.getMaxBackoffMs());
+                long sleepMs = computeJitteredBackoff(currentBackoffMs, retry.maxBackoffMs());
                 log.warn("Transient SFTP upload failure for '{}' to target '{}' (attempt {}/{}): {}. Retrying in {} ms",
-                        fileName, targetKey, attempt, maxAttempts, summarizeException(ex), sleepMs);
+                        paths.fileName(), targetKey, attempt, maxAttempts, summarizeException(ex), sleepMs);
                 sleepUninterruptibly(sleepMs);
                 currentBackoffMs = Math.min(
-                        retry.getMaxBackoffMs(),
-                        Math.round(currentBackoffMs * retry.getMultiplier()));
+                        retry.maxBackoffMs(),
+                        Math.round(currentBackoffMs * retry.multiplier()));
             }
         }
 
         throw new SftpUploadException(
-                "Failed to upload '" + fileName + "' to SFTP target '" + targetKey + "' after " + attemptsExecuted + " attempt(s)",
+                "Failed to upload '" + paths.fileName() + "' to SFTP target '" + targetKey + "' after " + attemptsExecuted + " attempt(s)",
                 lastException);
+    }
+
+    private void executeTransferWithBulkhead(
+            Semaphore bulkhead,
+            SessionFactory<SftpClient.DirEntry> sessionFactory,
+            TransferPaths paths
+    ) throws IOException {
+        try {
+            executeAtomicTransfer(sessionFactory, paths);
+        } finally {
+            // Release concurrency permit immediately after transfer attempt, before retry backoff sleep
+            bulkhead.release();
+        }
     }
 
     private void acquireBulkhead(Semaphore bulkhead, String targetKey, long timeoutMs) {
@@ -148,23 +153,28 @@ public class AtomicSftpUploader {
 
     private void executeAtomicTransfer(
             SessionFactory<SftpClient.DirEntry> sessionFactory,
-            Path localFile,
-            String tempRemotePath,
-            String finalRemotePath
+            TransferPaths paths
     ) throws IOException {
         try (Session<SftpClient.DirEntry> session = sessionFactory.getSession()) {
-            try (InputStream inputStream = new BufferedInputStream(
-                    Files.newInputStream(localFile, LinkOption.NOFOLLOW_LINKS), STREAM_BUFFER_BYTES)) {
-                session.write(inputStream, tempRemotePath);
-                session.rename(tempRemotePath, finalRemotePath);
-            } catch (IOException ex) {
-                // Always attempt cleanup of partial/orphan .tmp file (even if write() failed mid-stream)
-                cleanupRemoteTempFile(session, tempRemotePath);
-                throw ex;
-            } catch (RuntimeException ex) {
-                cleanupRemoteTempFile(session, tempRemotePath);
-                throw new IOException("Atomic SFTP transfer error: " + ex.getMessage(), ex);
-            }
+            streamAndRenameWithCleanup(session, paths);
+        }
+    }
+
+    private void streamAndRenameWithCleanup(
+            Session<SftpClient.DirEntry> session,
+            TransferPaths paths
+    ) throws IOException {
+        try (InputStream inputStream = new BufferedInputStream(
+                Files.newInputStream(paths.localFile(), LinkOption.NOFOLLOW_LINKS), STREAM_BUFFER_BYTES)) {
+            session.write(inputStream, paths.tempRemotePath());
+            session.rename(paths.tempRemotePath(), paths.finalRemotePath());
+        } catch (IOException ex) {
+            // Always attempt cleanup of partial/orphan .tmp file (even if write() failed mid-stream)
+            cleanupRemoteTempFile(session, paths.tempRemotePath());
+            throw ex;
+        } catch (RuntimeException ex) {
+            cleanupRemoteTempFile(session, paths.tempRemotePath());
+            throw new IOException("Atomic SFTP transfer error: " + ex.getMessage(), ex);
         }
     }
 
@@ -302,6 +312,9 @@ public class AtomicSftpUploader {
             cleaned = cleaned.substring(0, 200) + "...";
         }
         return root.getClass().getSimpleName() + ": " + cleaned;
+    }
+
+    private record TransferPaths(Path localFile, String fileName, String tempRemotePath, String finalRemotePath) {
     }
 
     public static class SftpUploadException extends RuntimeException {

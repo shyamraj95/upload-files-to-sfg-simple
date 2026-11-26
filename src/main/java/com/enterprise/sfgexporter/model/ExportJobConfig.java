@@ -1,214 +1,203 @@
 package com.enterprise.sfgexporter.model;
 
+import org.springframework.boot.context.properties.bind.DefaultValue;
+
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Declarative YAML configuration for a single Oracle-to-SFG export pipeline.
+ * Declarative immutable YAML configuration record for a single Oracle-to-SFG export pipeline.
  *
  * <p>Adding a new pipeline requires only appending a block under {@code app.jobs[]}
  * (and an optional {@code .sql} file for {@link SourceType#SQL_QUERY} jobs)—no Java code changes.</p>
  */
-public class ExportJobConfig {
+public record ExportJobConfig(
+        String name,
+        @DefaultValue("true") boolean enabled,
+        String cron,
+        @DefaultValue("UTC") String timeZone,
+        @DefaultValue("STORED_PROCEDURE") SourceType sourceType,
+        String schemaName,
+        String packageName,
+        String procedureName,
+        @DefaultValue("P_RESULT_CURSOR") String cursorParamName,
+        String sqlFile,
+        Map<String, Object> parameters,
+        @DefaultValue("1000") int fetchSize,
+        @DefaultValue("300") int queryTimeoutSeconds,
+        String filePrefix,
+        @DefaultValue("yyyyMMdd_HHmmss") String timestampPattern,
+        @DefaultValue CsvOptions csv,
+        String sftpTarget,
+        @DefaultValue("") String remoteDir
+) {
 
-    /** Unique job identifier (must match {@code ^[a-zA-Z0-9_]+$}); used in logs, locks, and health status. */
-    private String name;
-
-    /** Controls whether this job is registered with the scheduler on startup. */
-    private boolean enabled = true;
-
-    /** Spring 6-field cron expression ({@code second minute hour day-of-month month day-of-week}). */
-    private String cron;
-
-    /** IANA time zone ID used for cron evaluation and timestamped output filenames (default: {@code UTC}). */
-    private String timeZone = "UTC";
-
-    /** Data extraction strategy: Oracle PL/SQL {@code SYS_REFCURSOR} or external parameterized SQL file. */
-    private SourceType sourceType = SourceType.STORED_PROCEDURE;
-
-    /** Optional Oracle schema name for {@code STORED_PROCEDURE} jobs (allowlist {@code ^[a-zA-Z0-9_]+$}). */
-    private String schemaName;
-
-    /** Optional Oracle PL/SQL package name for {@code STORED_PROCEDURE} jobs (allowlist {@code ^[a-zA-Z0-9_]+$}). */
-    private String packageName;
-
-    /** Oracle stored procedure name (required when {@code sourceType == STORED_PROCEDURE}). */
-    private String procedureName;
-
-    /** Name of the {@code OUT SYS_REFCURSOR} parameter on the Oracle stored procedure. */
-    private String cursorParamName = "P_RESULT_CURSOR";
-
-    /** Spring resource URI to an external {@code .sql} file (required when {@code sourceType == SQL_QUERY}). */
-    private String sqlFile;
-
-    /**
-     * Optional IN parameters bound to the PL/SQL procedure (named {@code param => ?}) or SQL query
-     * ({@code :param}). LinkedHashMap preserves deterministic declaration order from YAML.
-     */
-    private Map<String, Object> parameters = new LinkedHashMap<>();
-
-    /** JDBC cursor fetch size controlling how many rows {@code ojdbc11} fetches per network round-trip. */
-    private int fetchSize = 1000;
-
-    /** Maximum JDBC statement execution timeout in seconds before Oracle cancels the query. */
-    private int queryTimeoutSeconds = 300;
-
-    /** Filename prefix for generated CSV files ({@code <filePrefix>_<timestamp>.csv}; allowlist {@code ^[a-zA-Z0-9_]+$}). */
-    private String filePrefix;
-
-    /** {@link java.time.format.DateTimeFormatter} pattern appended after {@code filePrefix}. */
-    private String timestampPattern = "yyyyMMdd_HHmmss";
-
-    /** Per-job CSV formatting options (delimiter, headers, quoting, charset, empty-file behavior). */
-    private CsvOptions csv = new CsvOptions();
-
-    /** Key matching an entry under {@code app.sftp-targets} defining the target IBM SFG server. */
-    private String sftpTarget;
-
-    /** Target mailbox/subdirectory appended to the SFTP target's {@code remote-base-dir}. */
-    private String remoteDir = "";
-
-    public String getName() {
-        return name;
+    public ExportJobConfig {
+        parameters = parameters == null
+                ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(parameters));
+        csv = csv != null ? csv : CsvOptions.defaults();
+        remoteDir = remoteDir != null ? remoteDir : "";
     }
 
-    public void setName(String name) {
-        this.name = name;
+    public static Builder builder() {
+        return new Builder();
     }
 
-    public boolean isEnabled() {
-        return enabled;
+    public Builder toBuilder() {
+        return new Builder()
+                .name(name)
+                .enabled(enabled)
+                .cron(cron)
+                .timeZone(timeZone)
+                .sourceType(sourceType)
+                .schemaName(schemaName)
+                .packageName(packageName)
+                .procedureName(procedureName)
+                .cursorParamName(cursorParamName)
+                .sqlFile(sqlFile)
+                .parameters(parameters)
+                .fetchSize(fetchSize)
+                .queryTimeoutSeconds(queryTimeoutSeconds)
+                .filePrefix(filePrefix)
+                .timestampPattern(timestampPattern)
+                .csv(csv)
+                .sftpTarget(sftpTarget)
+                .remoteDir(remoteDir);
     }
 
-    public void setEnabled(boolean enabled) {
-        this.enabled = enabled;
-    }
+    public static final class Builder {
+        private String name;
+        private boolean enabled = true;
+        private String cron;
+        private String timeZone = "UTC";
+        private SourceType sourceType = SourceType.STORED_PROCEDURE;
+        private String schemaName;
+        private String packageName;
+        private String procedureName;
+        private String cursorParamName = "P_RESULT_CURSOR";
+        private String sqlFile;
+        private Map<String, Object> parameters = new LinkedHashMap<>();
+        private int fetchSize = 1000;
+        private int queryTimeoutSeconds = 300;
+        private String filePrefix;
+        private String timestampPattern = "yyyyMMdd_HHmmss";
+        private CsvOptions csv = CsvOptions.defaults();
+        private String sftpTarget;
+        private String remoteDir = "";
 
-    public String getCron() {
-        return cron;
-    }
+        public Builder name(String name) {
+            this.name = name;
+            return this;
+        }
 
-    public void setCron(String cron) {
-        this.cron = cron;
-    }
+        public Builder enabled(boolean enabled) {
+            this.enabled = enabled;
+            return this;
+        }
 
-    public String getTimeZone() {
-        return timeZone;
-    }
+        public Builder cron(String cron) {
+            this.cron = cron;
+            return this;
+        }
 
-    public void setTimeZone(String timeZone) {
-        this.timeZone = timeZone;
-    }
+        public Builder timeZone(String timeZone) {
+            this.timeZone = timeZone;
+            return this;
+        }
 
-    public SourceType getSourceType() {
-        return sourceType;
-    }
+        public Builder sourceType(SourceType sourceType) {
+            this.sourceType = sourceType;
+            return this;
+        }
 
-    public void setSourceType(SourceType sourceType) {
-        this.sourceType = sourceType;
-    }
+        public Builder schemaName(String schemaName) {
+            this.schemaName = schemaName;
+            return this;
+        }
 
-    public String getSchemaName() {
-        return schemaName;
-    }
+        public Builder packageName(String packageName) {
+            this.packageName = packageName;
+            return this;
+        }
 
-    public void setSchemaName(String schemaName) {
-        this.schemaName = schemaName;
-    }
+        public Builder procedureName(String procedureName) {
+            this.procedureName = procedureName;
+            return this;
+        }
 
-    public String getPackageName() {
-        return packageName;
-    }
+        public Builder cursorParamName(String cursorParamName) {
+            this.cursorParamName = cursorParamName;
+            return this;
+        }
 
-    public void setPackageName(String packageName) {
-        this.packageName = packageName;
-    }
+        public Builder sqlFile(String sqlFile) {
+            this.sqlFile = sqlFile;
+            return this;
+        }
 
-    public String getProcedureName() {
-        return procedureName;
-    }
+        public Builder parameters(Map<String, Object> parameters) {
+            this.parameters = parameters != null ? new LinkedHashMap<>(parameters) : new LinkedHashMap<>();
+            return this;
+        }
 
-    public void setProcedureName(String procedureName) {
-        this.procedureName = procedureName;
-    }
+        public Builder fetchSize(int fetchSize) {
+            this.fetchSize = fetchSize;
+            return this;
+        }
 
-    public String getCursorParamName() {
-        return cursorParamName;
-    }
+        public Builder queryTimeoutSeconds(int queryTimeoutSeconds) {
+            this.queryTimeoutSeconds = queryTimeoutSeconds;
+            return this;
+        }
 
-    public void setCursorParamName(String cursorParamName) {
-        this.cursorParamName = cursorParamName;
-    }
+        public Builder filePrefix(String filePrefix) {
+            this.filePrefix = filePrefix;
+            return this;
+        }
 
-    public String getSqlFile() {
-        return sqlFile;
-    }
+        public Builder timestampPattern(String timestampPattern) {
+            this.timestampPattern = timestampPattern;
+            return this;
+        }
 
-    public void setSqlFile(String sqlFile) {
-        this.sqlFile = sqlFile;
-    }
+        public Builder csv(CsvOptions csv) {
+            this.csv = csv;
+            return this;
+        }
 
-    public Map<String, Object> getParameters() {
-        return parameters;
-    }
+        public Builder sftpTarget(String sftpTarget) {
+            this.sftpTarget = sftpTarget;
+            return this;
+        }
 
-    public void setParameters(Map<String, Object> parameters) {
-        this.parameters = parameters != null ? parameters : new LinkedHashMap<>();
-    }
+        public Builder remoteDir(String remoteDir) {
+            this.remoteDir = remoteDir;
+            return this;
+        }
 
-    public int getFetchSize() {
-        return fetchSize;
-    }
-
-    public void setFetchSize(int fetchSize) {
-        this.fetchSize = fetchSize;
-    }
-
-    public int getQueryTimeoutSeconds() {
-        return queryTimeoutSeconds;
-    }
-
-    public void setQueryTimeoutSeconds(int queryTimeoutSeconds) {
-        this.queryTimeoutSeconds = queryTimeoutSeconds;
-    }
-
-    public String getFilePrefix() {
-        return filePrefix;
-    }
-
-    public void setFilePrefix(String filePrefix) {
-        this.filePrefix = filePrefix;
-    }
-
-    public String getTimestampPattern() {
-        return timestampPattern;
-    }
-
-    public void setTimestampPattern(String timestampPattern) {
-        this.timestampPattern = timestampPattern;
-    }
-
-    public CsvOptions getCsv() {
-        return csv;
-    }
-
-    public void setCsv(CsvOptions csv) {
-        this.csv = csv != null ? csv : new CsvOptions();
-    }
-
-    public String getSftpTarget() {
-        return sftpTarget;
-    }
-
-    public void setSftpTarget(String sftpTarget) {
-        this.sftpTarget = sftpTarget;
-    }
-
-    public String getRemoteDir() {
-        return remoteDir;
-    }
-
-    public void setRemoteDir(String remoteDir) {
-        this.remoteDir = remoteDir;
+        public ExportJobConfig build() {
+            return new ExportJobConfig(
+                    name,
+                    enabled,
+                    cron,
+                    timeZone,
+                    sourceType,
+                    schemaName,
+                    packageName,
+                    procedureName,
+                    cursorParamName,
+                    sqlFile,
+                    parameters,
+                    fetchSize,
+                    queryTimeoutSeconds,
+                    filePrefix,
+                    timestampPattern,
+                    csv,
+                    sftpTarget,
+                    remoteDir
+            );
+        }
     }
 }

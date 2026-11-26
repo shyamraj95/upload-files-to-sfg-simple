@@ -63,11 +63,11 @@ public class BackupRetentionService {
     @Autowired
     public BackupRetentionService(AppProperties properties) {
         this(
-                Path.of(properties.getStorage().getStagingDir()),
-                Path.of(properties.getStorage().getBackupDir()),
-                properties.getStorage().getRetentionDays(),
-                properties.getStorage().getStagingPartMaxAgeHours(),
-                ZoneId.of(properties.getStorage().getCleanupTimeZone()),
+                Path.of(properties.storage().stagingDir()),
+                Path.of(properties.storage().backupDir()),
+                properties.storage().retentionDays(),
+                properties.storage().stagingPartMaxAgeHours(),
+                ZoneId.of(properties.storage().cleanupTimeZone()),
                 Clock.systemUTC()
         );
     }
@@ -190,17 +190,27 @@ public class BackupRetentionService {
         }
         try (DirectoryStream<Path> topLevelEntries = Files.newDirectoryStream(backupDir)) {
             for (Path entry : topLevelEntries) {
-                try {
-                    processBackupEntry(entry, today, cutoffDate, cutoffInstant, counters);
-                } catch (NoSuchFileException ignored) {
-                    // Entry disappeared concurrently during sweep
-                } catch (IOException | SecurityException ex) {
-                    log.warn("Skipping backup entry '{}' during cleanup: {}",
-                            entry.getFileName(), ex.getMessage());
-                }
+                processBackupEntrySafely(entry, today, cutoffDate, cutoffInstant, counters);
             }
         } catch (IOException ex) {
             log.error("Error during backup retention cleanup: {}", ex.getMessage(), ex);
+        }
+    }
+
+    private void processBackupEntrySafely(
+            Path entry,
+            LocalDate today,
+            LocalDate cutoffDate,
+            Instant cutoffInstant,
+            CleanupCounters counters
+    ) {
+        try {
+            processBackupEntry(entry, today, cutoffDate, cutoffInstant, counters);
+        } catch (NoSuchFileException ignored) {
+            // Entry disappeared concurrently during sweep
+        } catch (IOException | SecurityException ex) {
+            log.warn("Skipping backup entry '{}' during cleanup: {}",
+                    entry.getFileName(), ex.getMessage());
         }
     }
 
@@ -214,17 +224,26 @@ public class BackupRetentionService {
         }
         try (DirectoryStream<Path> entries = Files.newDirectoryStream(stagingDir)) {
             for (Path entry : entries) {
-                try {
-                    cleanupStagingEntry(entry, cutoffInstant, orphanPartCutoff, counters);
-                } catch (NoSuchFileException ignored) {
-                    // File was already promoted or archived concurrently
-                } catch (IOException | SecurityException ex) {
-                    log.warn("Skipping staging entry '{}' during cleanup: {}",
-                            entry.getFileName(), ex.getMessage());
-                }
+                cleanupStagingEntrySafely(entry, cutoffInstant, orphanPartCutoff, counters);
             }
         } catch (IOException ex) {
             log.error("Error during staging directory cleanup: {}", ex.getMessage(), ex);
+        }
+    }
+
+    private void cleanupStagingEntrySafely(
+            Path entry,
+            Instant cutoffInstant,
+            Instant orphanPartCutoff,
+            CleanupCounters counters
+    ) {
+        try {
+            cleanupStagingEntry(entry, cutoffInstant, orphanPartCutoff, counters);
+        } catch (NoSuchFileException ignored) {
+            // File was already promoted or archived concurrently
+        } catch (IOException | SecurityException ex) {
+            log.warn("Skipping staging entry '{}' during cleanup: {}",
+                    entry.getFileName(), ex.getMessage());
         }
     }
 
@@ -303,24 +322,30 @@ public class BackupRetentionService {
         int count = 0;
         try (DirectoryStream<Path> children = Files.newDirectoryStream(dateFolder)) {
             for (Path child : children) {
-                try {
-                    if (Files.isSymbolicLink(child)) {
-                        log.warn("Skipping symlink inside date folder '{}': {}", dateFolder.getFileName(), child.getFileName());
-                        continue;
-                    }
-                    Path safeChild = SecurityValidator.ensureChildPath(dateFolder, child);
-                    if (Files.isRegularFile(safeChild, LinkOption.NOFOLLOW_LINKS) && Files.deleteIfExists(safeChild)) {
-                        count++;
-                    }
-                } catch (NoSuchFileException ignored) {
-                    // File already removed concurrently
-                } catch (IOException | SecurityException ex) {
-                    log.warn("Skipping expired backup file '{}' inside '{}': {}",
-                            child.getFileName(), dateFolder.getFileName(), ex.getMessage());
+                if (deleteFileInsideFolderSafely(dateFolder, child)) {
+                    count++;
                 }
             }
         }
         return count;
+    }
+
+    private boolean deleteFileInsideFolderSafely(Path dateFolder, Path child) {
+        try {
+            if (Files.isSymbolicLink(child)) {
+                log.warn("Skipping symlink inside date folder '{}': {}", dateFolder.getFileName(), child.getFileName());
+                return false;
+            }
+            Path safeChild = SecurityValidator.ensureChildPath(dateFolder, child);
+            return Files.isRegularFile(safeChild, LinkOption.NOFOLLOW_LINKS) && Files.deleteIfExists(safeChild);
+        } catch (NoSuchFileException ignored) {
+            // File already removed concurrently
+            return false;
+        } catch (IOException | SecurityException ex) {
+            log.warn("Skipping expired backup file '{}' inside '{}': {}",
+                    child.getFileName(), dateFolder.getFileName(), ex.getMessage());
+            return false;
+        }
     }
 
     private boolean deleteFolderIfEmpty(Path folder) throws IOException {
@@ -373,5 +398,14 @@ public class BackupRetentionService {
     }
 
     public record CleanupSummary(int deletedFiles, int deletedFolders, LocalDate cutoffDate) {
+        public CleanupSummary {
+            if (deletedFiles < 0) {
+                throw new IllegalArgumentException("deletedFiles must be >= 0");
+            }
+            if (deletedFolders < 0) {
+                throw new IllegalArgumentException("deletedFolders must be >= 0");
+            }
+            Objects.requireNonNull(cutoffDate, "cutoffDate must not be null");
+        }
     }
 }

@@ -1,6 +1,11 @@
 # ==============================================================================
 # Oracle to IBM Sterling File Gateway (SFG) Exporter Configuration
 #
+# LEGEND:
+#   [REQUIRED]    - Must be set (via YAML or environment variable)
+#   [CONDITIONAL] - Required depending on auth method, host-key mode, or source-type
+#   [OPTIONAL]    - Has a built-in default value if omitted
+#
 # SECURITY POLICY:
 #   - NEVER hardcode passwords, passphrases, or private keys in this file.
 #   - All sensitive values MUST resolve from server environment variables.
@@ -9,95 +14,121 @@
 
 spring:
   application:
+    # [OPTIONAL] Logical application name for logs
     name: oracle-sfg-exporter
   main:
-    # Pure scheduled worker — no embedded web server overhead
+    # [OPTIONAL] Pure scheduled worker — disables embedded HTTP server overhead
     web-application-type: none
 
   # Oracle Database Connection (HikariCP)
   datasource:
+    # [REQUIRED] Oracle JDBC URL (e.g., jdbc:oracle:thin:@//host:1521/ORCLPDB1)
     url: ${ORACLE_DB_URL}
+    # [REQUIRED] Least-privilege Oracle service username
     username: ${ORACLE_DB_USER}
+    # [REQUIRED] Oracle password supplied via environment variable
     password: ${ORACLE_DB_PASSWORD}
+    # [REQUIRED] JDBC driver class (OracleDriver in production)
     driver-class-name: oracle.jdbc.OracleDriver
     hikari:
+      # [OPTIONAL] Connection pool identifier in logs/metrics
       pool-name: oracle-sfg-hikari
+      # [OPTIONAL] Max simultaneous DB connections (keep >= app.scheduler.pool-size)
       maximum-pool-size: 5
+      # [OPTIONAL] Minimum idle connections kept warm
       minimum-idle: 1
+      # [OPTIONAL] Max wait (ms) to borrow a connection from pool
       connection-timeout: 20000
+      # [OPTIONAL] Idle connection eviction threshold (ms)
       idle-timeout: 300000
+      # [OPTIONAL] Max connection lifetime (ms), shorter than Oracle firewall/DB timeouts
       max-lifetime: 1800000
-      # Bound Oracle TCP connect and SYS_REFCURSOR streaming socket reads so half-open sockets cannot hang jobs
-      # 660s provides 60s headroom above the longest job query-timeout-seconds (600s)
+      # [OPTIONAL] Oracle JDBC socket bounds so half-open DB sockets cannot hang jobs
+      # Keep ReadTimeout (660000 ms = 660s) above the longest job query-timeout-seconds (600s)
       data-source-properties:
         "[oracle.net.CONNECT_TIMEOUT]": 15000
         "[oracle.jdbc.ReadTimeout]": 660000
         "[oracle.net.keepAlive]": true
 
-# Minimal operational health endpoint (Spring Boot 4 access model; no web controllers)
-management:
-  endpoints:
-    access:
-      default: none
-  endpoint:
-    health:
-      access: read-only
-      show-details: when-authorized
-
+# [OPTIONAL] Safe logging policy (JDBC and SSHD kept at WARN so SQL params/row data never log)
 logging:
   level:
     root: INFO
     "[com.enterprise.sfgexporter]": INFO
-    # Keep JDBC and SSHD loggers at WARN/INFO so SQL parameters/row payloads are never emitted
     "[org.springframework.jdbc]": WARN
     "[org.apache.sshd]": WARN
   pattern:
     console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%thread] [job=%X{jobName:-none} run=%X{runId:-none}] %logger{36} - %msg%n"
 
 # ==============================================================================
-# Application Pipeline Configuration
+# Application Pipeline Configuration (app.*)
 # ==============================================================================
 app:
-  # Local filesystem staging, daily backup archive, and 15-day retention cleanup
+  # [OPTIONAL] Set true only in local dev if disabling strict-host-key-checking on a target (default: false)
+  # allow-insecure-sftp-dev-mode: false
+
+  # [OPTIONAL] Local staging, daily backup archive (yyyy-MM-dd/), and retention cleanup
   storage:
+    # [OPTIONAL] Working dir for in-progress (.part) and staged (.csv) files (code default: ./data/staging)
+    # Must be distinct from and not nested inside backup-dir
     staging-dir: ${APP_STAGING_DIR:/var/app/sfg-exporter/staging}
+    # [OPTIONAL] Archive root for delivered CSVs moved after SFTP upload (code default: ./data/backup)
     backup-dir: ${APP_BACKUP_DIR:/var/app/sfg-exporter/backup}
-    # Optional base directory confining external file: SQL resources (recommended when using file: queries)
+    # [OPTIONAL] Trusted base dir confining external file: SQL scripts; must be a non-symlink dir if set (default: "")
     sql-dir: ${APP_SQL_DIR:}
+    # [OPTIONAL] Days to keep backup CSVs and failed staged CSVs before purging (default: 15, min: 1)
     retention-days: ${APP_BACKUP_RETENTION_DAYS:15}
+    # [OPTIONAL] Hours before crash-orphaned .part files in staging-dir are deleted (default: 24, min: 1)
     staging-part-max-age-hours: 24
-    # Daily cleanup at 02:00 UTC deletes backup files and empty date folders older than retention-days
+    # [OPTIONAL] Spring 6-field cron for daily cleanup sweep (default: "0 0 2 * * *")
     cleanup-cron: "0 0 2 * * *"
+    # [OPTIONAL] IANA time zone for cleanup-cron and backup yyyy-MM-dd date folders (default: "UTC")
     cleanup-time-zone: "UTC"
 
-  # Dedicated thread pool for concurrent independent job schedules
+  # [OPTIONAL] Dedicated thread pool for concurrent scheduled export jobs
   scheduler:
+    # [OPTIONAL] Max concurrently executing export jobs (default: 4, min: 1)
     pool-size: 4
+    # [OPTIONAL] Worker thread name prefix in logs (default: "sfg-job-")
     thread-name-prefix: "sfg-job-"
+    # [OPTIONAL] Seconds to wait for active jobs during graceful shutdown (default: 60, min: 0)
     await-termination-seconds: 60
 
   # ----------------------------------------------------------------------------
   # Named IBM Sterling File Gateway (SFG) SFTP Targets
-  # Multiple jobs can reference the same target or point to separate SFG servers.
+  # [REQUIRED] Must define every target referenced by an enabled job under app.jobs[]
+  # Multiple jobs can share the same target (e.g., sfg-primary).
   # ----------------------------------------------------------------------------
   sftp-targets:
+    # Primary SFG SFTP target ([REQUIRED] while referenced by an enabled job)
     "[sfg-primary]":
+      # [REQUIRED] SFTP server hostname, IPv4, or IPv6 (no spaces/control chars)
       host: ${SFG_PRIMARY_HOST}
+      # [OPTIONAL] SFTP server SSH port (default: 22, range: 1-65535)
       port: ${SFG_PRIMARY_PORT:22}
+      # [REQUIRED] SFTP login username (non-whitespace ASCII only)
       username: ${SFG_PRIMARY_USER}
-      # Preferred: SSH Private Key authentication (mounted read-only with chmod 600)
-      private-key-path: ${SFG_SSH_KEY_PATH}
+      # [CONDITIONAL] SSH private key path (chmod 600, preferred); required unless password is set
+      private-key-path: ${SFG_SSH_KEY_PATH:}
+      # [OPTIONAL] Private key passphrase; needed only if the SSH private key is encrypted
       private-key-passphrase: ${SFG_SSH_KEY_PASSPHRASE:}
-      # Mandatory server-mounted OpenSSH known_hosts file (rejects unknown host keys by default)
+      # [CONDITIONAL] SFTP password; required unless private-key-path is set (key takes precedence)
+      password: ${SFG_PRIMARY_PASSWORD:}
+      # [CONDITIONAL] Pinned OpenSSH known_hosts file; required when strict-host-key-checking=true
       known-hosts-path: ${SFG_KNOWN_HOSTS_PATH}
+      # [OPTIONAL] Reject unknown/rotated server host keys (default: true; never disable in production)
       strict-host-key-checking: true
+      # [OPTIONAL] TCP/SSH connection timeout in ms (default: 15000, min: 1000)
       connect-timeout-ms: 15000
+      # [OPTIONAL] SSH authentication timeout in ms (default: 15000, min: 1000)
       auth-timeout-ms: 15000
+      # [OPTIONAL] SFTP subsystem channel open timeout in ms (default: 15000, min: 1000)
       channel-open-timeout-ms: 15000
-      # Atomic upload: uploads as <filename>.tmp then renames to <filename>.csv
+      # [OPTIONAL] Remote temp suffix uploaded first before atomic rename to .csv (default: ".tmp")
       temp-suffix: ".tmp"
+      # [OPTIONAL] Base SFG mailbox directory prefixed before each job's remote-dir (default: "")
       remote-base-dir: "/inbound"
-      # Modern strong cryptographic algorithms only (CBC, 3DES, SHA-1, MD5 disabled)
+      # [OPTIONAL] Strong SSH ciphers allowlist; omit to use built-in approved defaults (no CBC/3DES/none)
       allowed-ciphers:
         - "aes256-gcm@openssh.com"
         - "aes128-gcm@openssh.com"
@@ -105,6 +136,7 @@ app:
         - "aes256-ctr"
         - "aes192-ctr"
         - "aes128-ctr"
+      # [OPTIONAL] Strong SSH key-exchange allowlist; omit to use built-in approved defaults
       allowed-key-exchanges:
         - "curve25519-sha256"
         - "ecdh-sha2-nistp521"
@@ -114,77 +146,119 @@ app:
         - "diffie-hellman-group16-sha512"
         - "diffie-hellman-group14-sha256"
         - "diffie-hellman-group-exchange-sha256"
+      # [OPTIONAL] Strong SSH MAC allowlist; omit to use built-in approved defaults (no MD5/SHA-1)
       allowed-macs:
         - "hmac-sha2-512-etm@openssh.com"
         - "hmac-sha2-256-etm@openssh.com"
         - "hmac-sha2-512"
         - "hmac-sha2-256"
+      # [OPTIONAL] Exponential backoff retry settings for transient network errors (skips auth errors)
       retry:
+        # [OPTIONAL] Total upload attempts before failing (default: 3, range: 1-20)
         max-attempts: 4
+        # [OPTIONAL] Initial retry delay in ms, +/-15% jitter (default: 2000, min: 0)
         initial-backoff-ms: 2000
+        # [OPTIONAL] Backoff multiplier per attempt (default: 2.0, min: 1.0)
         multiplier: 2.0
+        # [OPTIONAL] Maximum delay cap in ms (default: 30000, max: 300000)
         max-backoff-ms: 30000
+      # [OPTIONAL] Max concurrent active SFTP uploads permitted to this target (default: 2, min: 1)
       max-concurrent-uploads: 2
 
-    # Secondary SFG target example using Password authentication (if key auth is unavailable)
+    # [OPTIONAL] Secondary SFG target — validated and initialized only when referenced by an enabled job.
+    # Leave unset or omit completely if only using sfg-primary. Supports SSH key or password auth.
     "[sfg-partner-b]":
-      host: ${SFG_SECONDARY_HOST:localhost}
-      port: ${SFG_SECONDARY_PORT:2222}
-      username: ${SFG_SECONDARY_USER:placeholder}
-      password: ${SFG_SFTP_PASSWORD:}
+      # [CONDITIONAL] Required only when an enabled job targets sfg-partner-b
+      host: ${SFG_SECONDARY_HOST:}
+      # [OPTIONAL] SFTP port (default: 22)
+      port: ${SFG_SECONDARY_PORT:22}
+      # [CONDITIONAL] Required only when an enabled job targets sfg-partner-b
+      username: ${SFG_SECONDARY_USER:}
+      # [CONDITIONAL] SSH private key path (chmod 600); required if password is unset
+      private-key-path: ${SFG_SECONDARY_SSH_KEY_PATH:}
+      # [OPTIONAL] Private key passphrase if encrypted
+      private-key-passphrase: ${SFG_SECONDARY_SSH_KEY_PASSPHRASE:}
+      # [CONDITIONAL] SFTP password; required if private-key-path is unset
+      password: ${SFG_SECONDARY_PASSWORD:${SFG_SFTP_PASSWORD:}}
+      # [CONDITIONAL] Pinned known_hosts path when strict-host-key-checking=true
       known-hosts-path: ${SFG_SECONDARY_KNOWN_HOSTS_PATH:${SFG_KNOWN_HOSTS_PATH:}}
+      # [OPTIONAL] Reject unknown host keys (default: true)
       strict-host-key-checking: true
+      # [OPTIONAL] Remote atomic temp suffix (default: ".tmp")
       temp-suffix: ".tmp"
+      # [OPTIONAL] Base SFG mailbox folder for this target (default: "")
       remote-base-dir: "/partner_drop"
+      # [OPTIONAL] Retry policy overrides (uses RetryConfig defaults if omitted)
       retry:
         max-attempts: 3
         initial-backoff-ms: 3000
         multiplier: 2.0
         max-backoff-ms: 30000
+      # [OPTIONAL] Max concurrent uploads to this target (default: 2)
       max-concurrent-uploads: 2
 
   # ----------------------------------------------------------------------------
   # Configurable Export Jobs (List-Based Extensibility)
-  # Add a new pipeline simply by appending a YAML block here (and optional .sql file).
-  # All names, schema/package/procedure identifiers, and file prefixes must match ^[a-zA-Z0-9_]+$
+  # [REQUIRED] List of export pipelines. Append a new item here to add another job.
+  # Identifiers (name, schema/package/procedure/cursor, parameters keys, file-prefix)
+  # must strictly match ^[a-zA-Z0-9_]+$
   # ----------------------------------------------------------------------------
   jobs:
-    # Job 1: Oracle PL/SQL Stored Procedure returning SYS_REFCURSOR
+    # Job 1 Example: Oracle PL/SQL Stored Procedure returning SYS_REFCURSOR (no .sql file needed)
     - name: daily_gl_journal_export
+      # [REQUIRED] Unique job name matching ^[a-zA-Z0-9_]+$
+      # [OPTIONAL] Enable or pause this schedule without deleting its YAML block (default: true)
       enabled: true
-      # Spring 6-field cron: sec min hour day-of-month month day-of-week (Daily at 06:00 UTC)
+      # [REQUIRED] Spring 6-field cron: second minute hour day-of-month month day-of-week
       cron: "0 0 6 * * *"
+      # [OPTIONAL] IANA time zone for cron trigger and CSV filename timestamp (default: "UTC")
       time-zone: "UTC"
+      # [OPTIONAL] Data extraction mode: STORED_PROCEDURE (default) or SQL_QUERY
       source-type: STORED_PROCEDURE
+      # [OPTIONAL] Oracle schema owner of the procedure/package (STORED_PROCEDURE only)
       schema-name: "FIN_REPORTING"
+      # [OPTIONAL] Oracle package name if procedure lives inside a package (STORED_PROCEDURE only)
       package-name: "PKG_SFG_EXPORTS"
+      # [CONDITIONAL] Required when source-type=STORED_PROCEDURE; DB procedure name
       procedure-name: "SP_EXPORT_DAILY_GL_JOURNALS"
+      # [OPTIONAL] OUT SYS_REFCURSOR parameter name in Oracle procedure (default: "P_RESULT_CURSOR")
       cursor-param-name: "P_RESULT_CURSOR"
+      # [OPTIONAL] Named input bind parameters passed in map order (keys must match ^[a-zA-Z0-9_]+$)
       parameters:
         "[P_LOOKBACK_DAYS]": 1
         "[P_LEDGER_CODE]": "CORP_US"
+      # [OPTIONAL] JDBC ResultSet fetch batch size to control network round-trips (default: 1000, min: 1)
       fetch-size: 2000
+      # [OPTIONAL] JDBC statement timeout in seconds; keep < Hikari ReadTimeout (default: 300, min: 1)
       query-timeout-seconds: 600
+      # [REQUIRED] Unique output CSV filename prefix matching ^[a-zA-Z0-9_]+$
       file-prefix: "GL_JOURNAL"
+      # [OPTIONAL] DateTimeFormatter pattern appended to file-prefix (default: "yyyyMMdd_HHmmss")
       timestamp-pattern: "yyyyMMdd_HHmmss"
+      # [OPTIONAL] CSV formatting options (entire block can be omitted to use built-in defaults;
+      # also supports neutralize-formulas [default: true] and max-clob-chars [default: 1048576])
       csv:
-        delimiter: ","
-        include-header: true
-        quote-char: "\""
-        record-separator: "\n"
-        null-string: ""
-        charset: "UTF-8"
-        write-empty-file: true
+        delimiter: ","          # [OPTIONAL] Single-char delimiter (default: ",")
+        include-header: true    # [OPTIONAL] Emit column header row (default: true)
+        quote-char: "\""        # [OPTIONAL] Single-char quote symbol or "" for unquoted (default: "\"")
+        record-separator: "\n"  # [OPTIONAL] Line ending, e.g. \n or \r\n (default: "\n")
+        null-string: ""         # [OPTIONAL] Text written for SQL NULL cells (default: "")
+        charset: "UTF-8"        # [OPTIONAL] Output file charset (default: "UTF-8")
+        write-empty-file: true  # [OPTIONAL] true uploads 0-row CSV; false skips upload/archive (default: true)
+      # [REQUIRED] Target key from app.sftp-targets above
       sftp-target: sfg-primary
+      # [OPTIONAL] Subfolder appended to target's remote-base-dir (default: "")
       remote-dir: "/finance/gl"
 
-    # Job 2: Parameterized external SQL query file (pipe-delimited, disabled by default as template)
+    # Job 2 Example: Parameterized external .sql file (disabled by default as a template)
     - name: hourly_payment_settlement
       enabled: false
       cron: "0 15 * * * *"
       time-zone: "America/New_York"
       source-type: SQL_QUERY
+      # [CONDITIONAL] Required when source-type=SQL_QUERY; classpath:sql/*.sql or file:*.sql (max 1 MiB)
       sql-file: "classpath:sql/hourly_payment_settlement.sql"
+      # [OPTIONAL] Named JDBC bind parameters matching :param placeholders in sql-file
       parameters:
         "[lookback_hours]": 1
         "[settlement_status]": "SETTLED"

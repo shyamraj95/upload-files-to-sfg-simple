@@ -1,25 +1,12 @@
 package com.enterprise.sfgexporter.config;
 
-import com.enterprise.sfgexporter.model.CsvOptions;
-import com.enterprise.sfgexporter.model.ExportJobConfig;
-import com.enterprise.sfgexporter.model.RetryConfig;
-import com.enterprise.sfgexporter.model.SftpTargetConfig;
-import com.enterprise.sfgexporter.model.SourceType;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.InitializingBean;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.core.io.DefaultResourceLoader;
-import org.springframework.core.io.ResourceLoader;
-import org.springframework.scheduling.support.CronExpression;
-import org.springframework.stereotype.Component;
-
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
+import java.time.DateTimeException;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -29,18 +16,40 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.scheduling.support.CronExpression;
+import org.springframework.stereotype.Component;
+
+import com.enterprise.sfgexporter.model.CsvOptions;
+import com.enterprise.sfgexporter.model.ExportJobConfig;
+import com.enterprise.sfgexporter.model.RetryConfig;
+import com.enterprise.sfgexporter.model.SftpTargetConfig;
+
 /**
- * Fail-fast startup security and configuration validator, plus reusable allowlist/path guards.
+ * Fail-fast startup security and configuration validator, plus reusable
+ * allowlist/path guards.
  *
- * <p>Runs automatically during Spring context startup ({@link InitializingBean}) to reject unsafe
- * or incomplete YAML configurations before any scheduler trigger fires:</p>
+ * <p>
+ * Runs automatically during Spring context startup ({@link InitializingBean})
+ * to reject unsafe
+ * or incomplete YAML configurations before any scheduler trigger fires:
+ * </p>
  * <ul>
- *     <li>Enforces strict allowlist regex {@code ^[a-zA-Z0-9_]+$} on SQL identifiers and file prefixes
- *         to prevent SQL injection and path traversal.</li>
- *     <li>Validates cron expressions, time zones, timestamp filename patterns, and CSV options.</li>
- *     <li>Verifies that enabled {@code SQL_QUERY} resources exist and enabled SFTP targets define
- *         authentication, strong cryptographic algorithms, and {@code known_hosts} when strict host
- *         key checking is enabled.</li>
+ * <li>Enforces strict allowlist regex {@code ^[a-zA-Z0-9_]+$} on SQL
+ * identifiers and file prefixes
+ * to prevent SQL injection and path traversal.</li>
+ * <li>Validates cron expressions, time zones, timestamp filename patterns, and
+ * CSV options.</li>
+ * <li>Verifies that enabled {@code SQL_QUERY} resources exist and enabled SFTP
+ * targets define
+ * authentication, strong cryptographic algorithms, and {@code known_hosts} when
+ * strict host
+ * key checking is enabled.</li>
  * </ul>
  */
 @Component
@@ -49,34 +58,57 @@ public class SecurityValidator implements InitializingBean {
     private static final Logger log = LoggerFactory.getLogger(SecurityValidator.class);
 
     /**
-     * Strict allowlist for SQL identifiers (schema, package, procedure, cursor, parameter names)
-     * and local file prefixes/job names. Blocks whitespace, quotes, semicolons, dots, and slashes.
-     * Without {@code Pattern.UNICODE_CHARACTER_CLASS}, {@code \w} matches ASCII {@code [a-zA-Z0-9_]} only.
+     * Strict allowlist for SQL identifiers (schema, package, procedure, cursor,
+     * parameter names)
+     * and local file prefixes/job names. Blocks whitespace, quotes, semicolons,
+     * dots, and slashes.
+     * Without {@code Pattern.UNICODE_CHARACTER_CLASS}, {@code \w} matches ASCII
+     * {@code [a-zA-Z0-9_]} only.
      */
     public static final Pattern STRICT_IDENTIFIER_PATTERN = Pattern.compile("^\\w+$");
 
-    /** Allowed characters in a formatted timestamp segment embedded in local/remote CSV filenames. */
+    /**
+     * Allowed characters in a formatted timestamp segment embedded in local/remote
+     * CSV filenames.
+     */
     private static final Pattern SAFE_TIMESTAMP_SAMPLE_PATTERN = Pattern.compile("^[\\w-]+$");
 
-    /** Allowed temporary suffix for atomic SFTP uploads (must start with a dot, e.g. {@code .tmp}). */
+    /**
+     * Allowed temporary suffix for atomic SFTP uploads (must start with a dot, e.g.
+     * {@code .tmp}).
+     */
     private static final Pattern SAFE_TEMP_SUFFIX_PATTERN = Pattern.compile("^\\.[\\w-]+$");
 
-    /** Allowed POSIX characters for remote SFG paths (blocks control chars, spaces, backslashes). */
+    /**
+     * Allowed POSIX characters for remote SFG paths (blocks control chars, spaces,
+     * backslashes).
+     */
     private static final Pattern SAFE_REMOTE_PATH_PATTERN = Pattern.compile("^[\\w./-]*$");
 
-    /** Allowed Spring resource URIs for external SQL files (must end in {@code .sql}). */
+    /**
+     * Allowed Spring resource URIs for external SQL files (must end in
+     * {@code .sql}).
+     */
     private static final Pattern SAFE_SQL_RESOURCE_PATTERN = Pattern.compile("^(classpath:|file:)[\\w./-]+\\.sql$");
 
-    /** Allowed SFTP target hostnames / IPv4 / IPv6 addresses (blocks whitespace, control chars, slashes, '@'). */
+    /**
+     * Allowed SFTP target hostnames / IPv4 / IPv6 addresses (blocks whitespace,
+     * control chars, slashes, '@').
+     */
     private static final Pattern SAFE_HOST_PATTERN = Pattern.compile("^[a-zA-Z0-9._:-]+$");
 
-    /** Allowed SFTP login usernames (printable non-whitespace ASCII only; blocks CRLF/control chars). */
+    /**
+     * Allowed SFTP login usernames (printable non-whitespace ASCII only; blocks
+     * CRLF/control chars).
+     */
     private static final Pattern SAFE_USERNAME_PATTERN = Pattern.compile("^[\\x21-\\x7E]+$");
 
     /** Allowed SFTP target key identifiers under {@code app.sftp-targets}. */
     private static final Pattern SAFE_TARGET_KEY_PATTERN = Pattern.compile("^[\\w.-]+$");
 
-    /** Allowed single-segment CSV filenames (blocks path separators and traversal). */
+    /**
+     * Allowed single-segment CSV filenames (blocks path separators and traversal).
+     */
     private static final Pattern SAFE_FILENAME_PATTERN = Pattern.compile("^[\\w.-]+$");
 
     private static final int MAX_RETRY_ATTEMPTS = 20;
@@ -99,58 +131,59 @@ public class SecurityValidator implements InitializingBean {
     public void afterPropertiesSet() {
         validateAll(properties);
         log.info("Configuration and security validation passed for {} configured job(s) and {} SFTP target(s)",
-                properties.getJobs().size(), properties.getSftpTargets().size());
+                properties.jobs().size(), properties.sftpTargets().size());
     }
 
     public void validateAll(AppProperties props) {
-        validateStorage(props.getStorage());
-        validateScheduler(props.getScheduler());
+        validateStorage(props.storage());
+        validateScheduler(props.scheduler());
 
         Set<String> seenJobNames = new HashSet<>();
         Set<String> seenFilePrefixes = new HashSet<>();
         Set<String> referencedTargets = new HashSet<>();
-        String allowedSqlDir = props.getStorage().getSqlDir();
+        String allowedSqlDir = props.storage().sqlDir();
 
-        for (ExportJobConfig job : props.getJobs()) {
-            validateJob(job, props.getSftpTargets(), seenJobNames, seenFilePrefixes, allowedSqlDir);
-            if (job.isEnabled()) {
-                referencedTargets.add(job.getSftpTarget());
+        for (ExportJobConfig job : props.jobs()) {
+            validateJob(job, props.sftpTargets(), seenJobNames, seenFilePrefixes, allowedSqlDir);
+            if (job.enabled()) {
+                referencedTargets.add(job.sftpTarget());
             }
         }
 
-        // Validate every SFTP target that is actively referenced by at least one enabled job
+        // Validate every SFTP target that is actively referenced by at least one
+        // enabled job
         for (String targetKey : referencedTargets) {
-            validateSftpTarget(targetKey, props.getSftpTargets().get(targetKey), props.isAllowInsecureSftpDevMode());
+            validateSftpTarget(targetKey, props.sftpTargets().get(targetKey), props.allowInsecureSftpDevMode());
         }
     }
 
     private void validateStorage(AppProperties.StorageConfig storage) {
-        requireNonBlank(storage.getStagingDir(), "app.storage.staging-dir");
-        requireNonBlank(storage.getBackupDir(), "app.storage.backup-dir");
-        Path staging = Path.of(storage.getStagingDir()).toAbsolutePath().normalize();
-        Path backup = Path.of(storage.getBackupDir()).toAbsolutePath().normalize();
+        requireNonBlank(storage.stagingDir(), "app.storage.staging-dir");
+        requireNonBlank(storage.backupDir(), "app.storage.backup-dir");
+        Path staging = Path.of(storage.stagingDir()).toAbsolutePath().normalize();
+        Path backup = Path.of(storage.backupDir()).toAbsolutePath().normalize();
         if (staging.equals(backup) || staging.startsWith(backup) || backup.startsWith(staging)) {
             throw new IllegalArgumentException(
                     "app.storage.staging-dir and app.storage.backup-dir must be distinct, non-nested directories");
         }
-        if (isNotBlank(storage.getSqlDir())) {
-            Path sqlDir = Path.of(storage.getSqlDir()).toAbsolutePath().normalize();
+        if (isNotBlank(storage.sqlDir())) {
+            Path sqlDir = Path.of(storage.sqlDir()).toAbsolutePath().normalize();
             if (Files.isSymbolicLink(sqlDir) || !Files.isDirectory(sqlDir, LinkOption.NOFOLLOW_LINKS)) {
                 throw new IllegalArgumentException(
                         "app.storage.sql-dir must be an existing non-symlink directory: " + sqlDir);
             }
         }
-        requireMin(storage.getRetentionDays(), 1, "app.storage.retention-days");
-        requireMin(storage.getStagingPartMaxAgeHours(), 1, "app.storage.staging-part-max-age-hours");
-        validateCron(storage.getCleanupCron(), "app.storage.cleanup-cron");
-        validateTimeZone(storage.getCleanupTimeZone(), "app.storage.cleanup-time-zone");
+        requireMin(storage.retentionDays(), 1, "app.storage.retention-days");
+        requireMin(storage.stagingPartMaxAgeHours(), 1, "app.storage.staging-part-max-age-hours");
+        validateCron(storage.cleanupCron(), "app.storage.cleanup-cron");
+        validateTimeZone(storage.cleanupTimeZone(), "app.storage.cleanup-time-zone");
     }
 
     private void validateScheduler(AppProperties.SchedulerConfig scheduler) {
-        if (scheduler.getPoolSize() < 1) {
+        if (scheduler.poolSize() < 1) {
             throw new IllegalArgumentException("app.scheduler.pool-size must be >= 1");
         }
-        if (scheduler.getAwaitTerminationSeconds() < 0) {
+        if (scheduler.awaitTerminationSeconds() < 0) {
             throw new IllegalArgumentException("app.scheduler.await-termination-seconds must be >= 0");
         }
     }
@@ -160,76 +193,72 @@ public class SecurityValidator implements InitializingBean {
             Map<String, SftpTargetConfig> sftpTargets,
             Set<String> seenJobNames,
             Set<String> seenFilePrefixes,
-            String allowedSqlDir
-    ) {
-        validateIdentifier(job.getName(), "job.name");
-        if (!seenJobNames.add(job.getName())) {
-            throw new IllegalArgumentException("Duplicate job name configured: " + job.getName());
+            String allowedSqlDir) {
+        validateIdentifier(job.name(), "job.name");
+        if (!seenJobNames.add(job.name())) {
+            throw new IllegalArgumentException("Duplicate job name configured: " + job.name());
         }
 
-        String prefix = "app.jobs[" + job.getName() + "]";
-        validateIdentifier(job.getFilePrefix(), prefix + ".file-prefix");
-        if (!seenFilePrefixes.add(job.getFilePrefix())) {
+        String prefix = "app.jobs[" + job.name() + "]";
+        validateIdentifier(job.filePrefix(), prefix + ".file-prefix");
+        if (!seenFilePrefixes.add(job.filePrefix())) {
             throw new IllegalArgumentException(
-                    "Duplicate file-prefix '" + job.getFilePrefix() + "' configured across jobs");
+                    "Duplicate file-prefix '" + job.filePrefix() + "' configured across jobs");
         }
-        validateCron(job.getCron(), prefix + ".cron");
-        validateTimeZone(job.getTimeZone(), prefix + ".time-zone");
-        validateTimestampPattern(job.getTimestampPattern(), prefix + ".timestamp-pattern");
+        validateCron(job.cron(), prefix + ".cron");
+        validateTimeZone(job.timeZone(), prefix + ".time-zone");
+        validateTimestampPattern(job.timestampPattern(), prefix + ".timestamp-pattern");
 
-        requireMin(job.getFetchSize(), 1, prefix + ".fetch-size");
-        requireMin(job.getQueryTimeoutSeconds(), 1, prefix + ".query-timeout-seconds");
+        requireMin(job.fetchSize(), 1, prefix + ".fetch-size");
+        requireMin(job.queryTimeoutSeconds(), 1, prefix + ".query-timeout-seconds");
 
         validateJobSource(job, prefix, allowedSqlDir);
 
-        for (String paramName : job.getParameters().keySet()) {
+        for (String paramName : job.parameters().keySet()) {
             validateIdentifier(paramName, prefix + ".parameters key");
         }
 
-        validateCsvOptions(job.getCsv(), prefix + ".csv");
+        validateCsvOptions(job.csv(), prefix + ".csv");
 
-        requireNonBlank(job.getSftpTarget(), prefix + ".sftp-target");
-        if (!sftpTargets.containsKey(job.getSftpTarget())) {
+        requireNonBlank(job.sftpTarget(), prefix + ".sftp-target");
+        if (job.enabled() && !sftpTargets.containsKey(job.sftpTarget())) {
             throw new IllegalArgumentException(
-                    prefix + ".sftp-target references unknown target '" + job.getSftpTarget() + "'");
+                    prefix + ".sftp-target references unknown target '" + job.sftpTarget() + "'");
         }
 
-        if (isNotBlank(job.getRemoteDir())) {
-            validateRemotePath(job.getRemoteDir(), prefix + ".remote-dir");
+        if (isNotBlank(job.remoteDir())) {
+            validateRemotePath(job.remoteDir(), prefix + ".remote-dir");
         }
     }
 
     private void validateJobSource(ExportJobConfig job, String prefix, String allowedSqlDir) {
-        if (job.getSourceType() == null) {
-            throw new IllegalArgumentException(prefix + ".source-type must be STORED_PROCEDURE or SQL_QUERY");
-        }
-
-        if (job.getSourceType() == SourceType.STORED_PROCEDURE) {
-            validateStoredProcedureSource(job, prefix);
-        } else if (job.getSourceType() == SourceType.SQL_QUERY) {
-            validateSqlQuerySource(job, prefix, allowedSqlDir);
+        switch (job.sourceType()) {
+            case STORED_PROCEDURE -> validateStoredProcedureSource(job, prefix);
+            case SQL_QUERY -> validateSqlQuerySource(job, prefix, allowedSqlDir);
+            case null -> throw new IllegalArgumentException(
+                    prefix + ".source-type must be STORED_PROCEDURE or SQL_QUERY");
         }
     }
 
     private void validateStoredProcedureSource(ExportJobConfig job, String prefix) {
-        if (isNotBlank(job.getSchemaName())) {
-            validateIdentifier(job.getSchemaName(), prefix + ".schema-name");
+        if (isNotBlank(job.schemaName())) {
+            validateIdentifier(job.schemaName(), prefix + ".schema-name");
         }
-        if (isNotBlank(job.getPackageName())) {
-            validateIdentifier(job.getPackageName(), prefix + ".package-name");
+        if (isNotBlank(job.packageName())) {
+            validateIdentifier(job.packageName(), prefix + ".package-name");
         }
-        validateIdentifier(job.getProcedureName(), prefix + ".procedure-name");
-        validateIdentifier(job.getCursorParamName(), prefix + ".cursor-param-name");
+        validateIdentifier(job.procedureName(), prefix + ".procedure-name");
+        validateIdentifier(job.cursorParamName(), prefix + ".cursor-param-name");
     }
 
     private void validateSqlQuerySource(ExportJobConfig job, String prefix, String allowedSqlDir) {
-        validateSqlFileLocation(job.getSqlFile(), prefix + ".sql-file");
-        if (job.isEnabled() && !resourceLoader.getResource(job.getSqlFile()).exists()) {
+        validateSqlFileLocation(job.sqlFile(), prefix + ".sql-file");
+        if (job.enabled() && !resourceLoader.getResource(job.sqlFile()).exists()) {
             throw new IllegalArgumentException(
-                    prefix + ".sql-file resource does not exist: " + job.getSqlFile());
+                    prefix + ".sql-file resource does not exist: " + job.sqlFile());
         }
-        if (job.isEnabled() && job.getSqlFile().startsWith("file:")) {
-            validateExternalSqlFileSecurity(job.getSqlFile(), allowedSqlDir);
+        if (job.enabled() && job.sqlFile().startsWith("file:")) {
+            validateExternalSqlFileSecurity(job.sqlFile(), allowedSqlDir);
         }
     }
 
@@ -242,67 +271,71 @@ public class SecurityValidator implements InitializingBean {
         if (target == null) {
             throw new IllegalArgumentException(prefix + " must not be null");
         }
-        requireNonBlank(target.getHost(), prefix + ".host");
-        if (!SAFE_HOST_PATTERN.matcher(target.getHost()).matches()) {
+        requireNonBlank(target.host(), prefix + ".host");
+        if (!SAFE_HOST_PATTERN.matcher(target.host()).matches()) {
             throw new IllegalArgumentException(
                     prefix + ".host contains invalid or unsafe characters");
         }
-        if (target.getPort() < 1 || target.getPort() > 65535) {
+        if (target.port() < 1 || target.port() > 65535) {
             throw new IllegalArgumentException(prefix + ".port must be between 1 and 65535");
         }
-        requireNonBlank(target.getUsername(), prefix + ".username");
-        if (!SAFE_USERNAME_PATTERN.matcher(target.getUsername()).matches()) {
+        requireNonBlank(target.username(), prefix + ".username");
+        if (!SAFE_USERNAME_PATTERN.matcher(target.username()).matches()) {
             throw new IllegalArgumentException(
                     prefix + ".username contains invalid or control characters");
         }
 
         validateSftpSecuritySettings(targetKey, target, prefix, allowInsecureSftpDevMode);
 
-        if (!isNotBlank(target.getTempSuffix()) || !SAFE_TEMP_SUFFIX_PATTERN.matcher(target.getTempSuffix()).matches()) {
+        if (!isNotBlank(target.tempSuffix())
+                || !SAFE_TEMP_SUFFIX_PATTERN.matcher(target.tempSuffix()).matches()) {
             throw new IllegalArgumentException(
                     prefix + ".temp-suffix must match " + SAFE_TEMP_SUFFIX_PATTERN.pattern());
         }
 
-        if (isNotBlank(target.getRemoteBaseDir())) {
-            validateRemotePath(target.getRemoteBaseDir(), prefix + ".remote-base-dir");
+        if (isNotBlank(target.remoteBaseDir())) {
+            validateRemotePath(target.remoteBaseDir(), prefix + ".remote-base-dir");
         }
 
-        if (target.getConnectTimeoutMs() < 1000 || target.getAuthTimeoutMs() < 1000 || target.getChannelOpenTimeoutMs() < 1000) {
+        if (target.connectTimeoutMs() < 1000 || target.authTimeoutMs() < 1000
+                || target.channelOpenTimeoutMs() < 1000) {
             throw new IllegalArgumentException(prefix + " timeouts must be >= 1000 ms");
         }
 
-        requireMin(target.getMaxConcurrentUploads(), 1, prefix + ".max-concurrent-uploads");
-        validateRetryConfig(target.getRetry(), prefix + ".retry");
+        requireMin(target.maxConcurrentUploads(), 1, prefix + ".max-concurrent-uploads");
+        validateRetryConfig(target.retry(), prefix + ".retry");
     }
 
     private void validateSftpSecuritySettings(
             String targetKey,
             SftpTargetConfig target,
             String prefix,
-            boolean allowInsecureSftpDevMode
-    ) {
+            boolean allowInsecureSftpDevMode) {
         if (!target.hasPrivateKeyAuth() && !target.hasPasswordAuth()) {
             throw new IllegalArgumentException(
                     prefix + " must configure either private-key-path (preferred) or password via environment variables");
         }
 
-        if (target.isStrictHostKeyChecking()) {
-            requireNonBlank(target.getKnownHostsPath(),
+        if (target.strictHostKeyChecking()) {
+            requireNonBlank(target.knownHostsPath(),
                     prefix + ".known-hosts-path (required when strict-host-key-checking=true)");
         } else if (!allowInsecureSftpDevMode) {
             throw new IllegalArgumentException(
                     prefix + ".strict-host-key-checking=false is prohibited unless app.allow-insecure-sftp-dev-mode=true");
         } else {
-            log.warn("SECURITY WARNING: strict-host-key-checking is disabled for SFTP target '{}' (dev mode opt-in active). "
-                    + "Do NOT disable host key verification in production!", targetKey);
+            log.warn(
+                    "SECURITY WARNING: strict-host-key-checking is disabled for SFTP target '{}' (dev mode opt-in active). "
+                            + "Do NOT disable host key verification in production!",
+                    targetKey);
         }
 
         validateAlgorithmAllowlist(
-                target.getAllowedCiphers(), SftpTargetConfig.APPROVED_STRONG_CIPHERS, prefix + ".allowed-ciphers");
+                target.allowedCiphers(), SftpTargetConfig.APPROVED_STRONG_CIPHERS, prefix + ".allowed-ciphers");
         validateAlgorithmAllowlist(
-                target.getAllowedKeyExchanges(), SftpTargetConfig.APPROVED_STRONG_KEX, prefix + ".allowed-key-exchanges");
+                target.allowedKeyExchanges(), SftpTargetConfig.APPROVED_STRONG_KEX,
+                prefix + ".allowed-key-exchanges");
         validateAlgorithmAllowlist(
-                target.getAllowedMacs(), SftpTargetConfig.APPROVED_STRONG_MACS, prefix + ".allowed-macs");
+                target.allowedMacs(), SftpTargetConfig.APPROVED_STRONG_MACS, prefix + ".allowed-macs");
     }
 
     private void validateAlgorithmAllowlist(List<String> configured, Set<String> approved, String fieldName) {
@@ -319,18 +352,18 @@ public class SecurityValidator implements InitializingBean {
         if (retry == null) {
             throw new IllegalArgumentException(prefix + " must not be null");
         }
-        if (retry.getMaxAttempts() < 1 || retry.getMaxAttempts() > MAX_RETRY_ATTEMPTS) {
+        if (retry.maxAttempts() < 1 || retry.maxAttempts() > MAX_RETRY_ATTEMPTS) {
             throw new IllegalArgumentException(
                     prefix + ".max-attempts must be between 1 and " + MAX_RETRY_ATTEMPTS);
         }
-        if (retry.getInitialBackoffMs() < 0) {
+        if (retry.initialBackoffMs() < 0) {
             throw new IllegalArgumentException(prefix + ".initial-backoff-ms must be >= 0");
         }
-        if (retry.getMultiplier() < 1.0) {
+        if (retry.multiplier() < 1.0) {
             throw new IllegalArgumentException(prefix + ".multiplier must be >= 1.0");
         }
-        if (retry.getMaxBackoffMs() < retry.getInitialBackoffMs()
-                || retry.getMaxBackoffMs() > MAX_RETRY_BACKOFF_MS) {
+        if (retry.maxBackoffMs() < retry.initialBackoffMs()
+                || retry.maxBackoffMs() > MAX_RETRY_BACKOFF_MS) {
             throw new IllegalArgumentException(
                     prefix + ".max-backoff-ms must be >= initial-backoff-ms and <= " + MAX_RETRY_BACKOFF_MS);
         }
@@ -340,20 +373,20 @@ public class SecurityValidator implements InitializingBean {
         if (csv == null) {
             throw new IllegalArgumentException(prefix + " must not be null");
         }
-        if (csv.getDelimiter() == null || csv.getDelimiter().length() != 1) {
+        if (csv.delimiter() == null || csv.delimiter().length() != 1) {
             throw new IllegalArgumentException(prefix + ".delimiter must be exactly 1 character");
         }
-        if (csv.getQuoteChar() != null && csv.getQuoteChar().length() > 1) {
+        if (csv.quoteChar() != null && csv.quoteChar().length() > 1) {
             throw new IllegalArgumentException(prefix + ".quote-char must be empty or 1 character");
         }
-        if (csv.getRecordSeparator() == null || csv.getRecordSeparator().isEmpty()) {
+        if (csv.recordSeparator() == null || csv.recordSeparator().isEmpty()) {
             throw new IllegalArgumentException(prefix + ".record-separator must not be empty");
         }
-        requireNonBlank(csv.getCharset(), prefix + ".charset");
-        if (!Charset.isSupported(csv.getCharset())) {
-            throw new IllegalArgumentException(prefix + ".charset is not supported: " + csv.getCharset());
+        requireNonBlank(csv.charset(), prefix + ".charset");
+        if (!Charset.isSupported(csv.charset())) {
+            throw new IllegalArgumentException(prefix + ".charset is not supported: " + csv.charset());
         }
-        requireMin(csv.getMaxClobChars(), 1, prefix + ".max-clob-chars");
+        requireMin(csv.maxClobChars(), 1, prefix + ".max-clob-chars");
     }
 
     private void validateTimestampPattern(String pattern, String fieldName) {
@@ -379,7 +412,11 @@ public class SecurityValidator implements InitializingBean {
 
     private void validateTimeZone(String timeZone, String fieldName) {
         requireNonBlank(timeZone, fieldName);
-        ZoneId.of(timeZone);
+        try {
+            ZoneId.of(timeZone);
+        } catch (DateTimeException ex) {
+            throw new IllegalArgumentException("Invalid " + fieldName + ": " + ex.getMessage(), ex);
+        }
     }
 
     public static void validateIdentifier(String value, String fieldName) {
@@ -396,7 +433,8 @@ public class SecurityValidator implements InitializingBean {
                 || sqlFile.contains("//")
                 || !SAFE_SQL_RESOURCE_PATTERN.matcher(sqlFile).matches()) {
             throw new IllegalArgumentException(
-                    "Unsafe or invalid " + fieldName + ": must be a safe classpath: or file: .sql resource without path traversal");
+                    "Unsafe or invalid " + fieldName
+                            + ": must be a safe classpath: or file: .sql resource without path traversal");
         }
     }
 
@@ -431,8 +469,10 @@ public class SecurityValidator implements InitializingBean {
     }
 
     /**
-     * Enforces symlink rejection, base-directory confinement (when {@code allowedSqlDir} is configured),
-     * and non-world-writability on external {@code file:} SQL resources, returning the verified real path.
+     * Enforces symlink rejection, base-directory confinement (when
+     * {@code allowedSqlDir} is configured),
+     * and non-world-writability on external {@code file:} SQL resources, returning
+     * the verified real path.
      */
     public static Path validateExternalSqlFileSecurity(String fileResourceUri, String allowedSqlDir) {
         Path rawPath = Path.of(fileResourceUri.substring("file:".length()));
@@ -452,7 +492,8 @@ public class SecurityValidator implements InitializingBean {
             return realSqlPath;
         } catch (IOException ex) {
             throw new IllegalArgumentException(
-                    "Unable to verify external SQL file security for '" + fileResourceUri + "': " + ex.getMessage(), ex);
+                    "Unable to verify external SQL file security for '" + fileResourceUri + "': " + ex.getMessage(),
+                    ex);
         }
     }
 
@@ -468,7 +509,8 @@ public class SecurityValidator implements InitializingBean {
     }
 
     /**
-     * Defense-in-depth check ensuring a resolved local path stays strictly inside its base directory
+     * Defense-in-depth check ensuring a resolved local path stays strictly inside
+     * its base directory
      * (rejecting both escaping paths and the base directory itself).
      */
     public static Path ensureChildPath(Path baseDir, Path candidate) {

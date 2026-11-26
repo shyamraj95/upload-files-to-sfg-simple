@@ -30,7 +30,7 @@ import com.enterprise.sfgexporter.sftp.AtomicSftpUploader;
  *     <li>Streams Oracle PL/SQL or SQL results into a timestamped CSV in {@code staging/}.</li>
  *     <li>Atomically uploads the staged CSV ({@code .tmp} -&gt; {@code .csv}) to IBM SFG via SFTP.</li>
  *     <li>Archives the uploaded CSV from {@code staging/} into {@code backup/yyyy-MM-dd/}.</li>
- *     <li>Records the immutable {@link JobExecutionResult} for {@link ExportJobsHealthIndicator}.</li>
+ *     <li>Records the latest immutable {@link JobExecutionResult} per job via {@link #getLastResults()}.</li>
  * </ol>
  *
  * <p>On SFTP failure after retries are exhausted, the staged CSV is retained in {@code staging/} and
@@ -59,7 +59,7 @@ public class ExportJobOrchestrator {
     }
 
     public JobExecutionResult executeJob(ExportJobConfig job) {
-        String jobName = job.getName();
+        String jobName = job.name();
         String runId = UUID.randomUUID().toString().substring(0, 8);
         Instant startedAt = Instant.now();
 
@@ -77,7 +77,7 @@ public class ExportJobOrchestrator {
         String uploadedRemotePath = null;
         try {
             log.info("Starting export job '{}' [sourceType={}, sftpTarget={}]",
-                    jobName, job.getSourceType(), job.getSftpTarget());
+                    jobName, job.sourceType(), job.sftpTarget());
 
             // Step 1 & 2: Stream Oracle PL/SQL or SQL ResultSet directly to timestamped CSV in staging/
             StreamingCsvWriter.StagedCsvFile stagedCsv = dataExtractor.extractToCsv(job);
@@ -91,7 +91,7 @@ public class ExportJobOrchestrator {
 
             // Step 3: Atomic SFTP upload (.tmp -> rename .csv) with exponential backoff retry
             uploadedRemotePath = sftpUploader.uploadAtomically(
-                    stagedFilePath, job.getSftpTarget(), job.getRemoteDir());
+                    stagedFilePath, job.sftpTarget(), job.remoteDir());
             uploaded = true;
 
             // Step 4: Move uploaded CSV from staging/ to backup/yyyy-MM-dd/
@@ -148,15 +148,18 @@ public class ExportJobOrchestrator {
         while (root.getCause() != null && root.getCause() != root && depth++ < 32) {
             root = root.getCause();
         }
-        if (root instanceof SQLException sqlEx) {
-            return "SQLException[vendorCode=" + sqlEx.getErrorCode() + ", sqlState=" + sqlEx.getSQLState() + "]";
-        }
-        String rawMessage = root.getMessage();
-        String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\p{Cntrl}]+", " ");
-        if (cleaned.length() > 200) {
-            cleaned = cleaned.substring(0, 200) + "...";
-        }
-        return root.getClass().getSimpleName() + ": " + cleaned;
+        return switch (root) {
+            case SQLException sqlEx ->
+                    "SQLException[vendorCode=" + sqlEx.getErrorCode() + ", sqlState=" + sqlEx.getSQLState() + "]";
+            default -> {
+                String rawMessage = root.getMessage();
+                String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\p{Cntrl}]+", " ");
+                if (cleaned.length() > 200) {
+                    cleaned = cleaned.substring(0, 200) + "...";
+                }
+                yield root.getClass().getSimpleName() + ": " + cleaned;
+            }
+        };
     }
 
     public Map<String, JobExecutionResult> getLastResults() {

@@ -29,12 +29,15 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLXML;
+import java.sql.Statement;
+import java.sql.Types;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.SequencedMap;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -90,21 +93,26 @@ class StreamingCsvWriterAndExtractorTest {
         this.extractor = new OracleDataExtractor(dataSource, new DefaultResourceLoader(), csvWriter);
     }
 
+    /**
+     * Verifies end-to-end parameterized {@code SQL_QUERY} extraction against H2, streaming rows
+     * into a timestamped CSV file with custom pipe ({@code |}) delimiter, RFC-4180 quote escaping,
+     * plain {@link BigDecimal} formatting, and custom null handling.
+     */
     @Test
     void streamsParameterizedSqlQueryToTimestampedCsv() throws Exception {
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("settlement_export");
-        job.setSourceType(SourceType.SQL_QUERY);
-        job.setSqlFile("classpath:sql/test_export.sql");
-        job.setParameters(Map.of("status", "SETTLED"));
-        job.setFilePrefix("PMT_SETTLEMENT");
-        job.setTimeZone("UTC");
-
-        CsvOptions csv = new CsvOptions();
-        csv.setDelimiter("|");
-        csv.setIncludeHeader(true);
-        csv.setNullString("");
-        job.setCsv(csv);
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("settlement_export")
+                .sourceType(SourceType.SQL_QUERY)
+                .sqlFile("classpath:sql/test_export.sql")
+                .parameters(Map.of("status", "SETTLED"))
+                .filePrefix("PMT_SETTLEMENT")
+                .timeZone("UTC")
+                .csv(CsvOptions.builder()
+                        .delimiter("|")
+                        .includeHeader(true)
+                        .nullString("")
+                        .build())
+                .build();
 
         StreamingCsvWriter.StagedCsvFile result = extractor.extractToCsv(job);
 
@@ -114,22 +122,27 @@ class StreamingCsvWriterAndExtractorTest {
         assertThat(Files.exists(result.filePath())).isTrue();
 
         List<String> lines = Files.readAllLines(result.filePath());
-        assertThat(lines).hasSize(4);
-        assertThat(lines.get(0)).isEqualTo("ID|ACCOUNT_CODE|AMOUNT|NOTE");
-        assertThat(lines.get(1)).isEqualTo("1|ACC_100|12345.67|Normal row");
-        assertThat(lines.get(2)).isEqualTo("2|ACC_200|99000000.00|\"Row, with \"\"quotes\"\"\"");
-        assertThat(lines.get(3)).isEqualTo("3|ACC_300|50.00|");
+        assertThat(lines).containsExactly(
+                "ID|ACCOUNT_CODE|AMOUNT|NOTE",
+                "1|ACC_100|12345.67|Normal row",
+                "2|ACC_200|99000000.00|\"Row, with \"\"quotes\"\"\"",
+                "3|ACC_300|50.00|");
     }
 
+    /**
+     * Verifies that when a query returns 0 rows and {@code write-empty-file=false}, no CSV or
+     * leftover {@code .part} file is created in {@code staging/}.
+     */
     @Test
     void skipsCreatingFileWhenZeroRowsAndWriteEmptyFileIsFalse() {
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("empty_export");
-        job.setSourceType(SourceType.SQL_QUERY);
-        job.setSqlFile("classpath:sql/test_export.sql");
-        job.setParameters(Map.of("status", "NON_EXISTENT"));
-        job.setFilePrefix("EMPTY_TEST");
-        job.getCsv().setWriteEmptyFile(false);
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("empty_export")
+                .sourceType(SourceType.SQL_QUERY)
+                .sqlFile("classpath:sql/test_export.sql")
+                .parameters(Map.of("status", "NON_EXISTENT"))
+                .filePrefix("EMPTY_TEST")
+                .csv(CsvOptions.builder().writeEmptyFile(false).build())
+                .build();
 
         StreamingCsvWriter.StagedCsvFile result = extractor.extractToCsv(job);
 
@@ -137,19 +150,26 @@ class StreamingCsvWriterAndExtractorTest {
         assertThat(result.rowCount()).isZero();
     }
 
+    /**
+     * Verifies that {@link OracleDataExtractor#buildSafeProcedureCallSql(ExportJobConfig)} generates
+     * an allowlist-validated Oracle PL/SQL named-parameter call ({@code PARAM => ?}) preserving
+     * parameter declaration order and appending the {@code SYS_REFCURSOR} OUT parameter last.
+     */
     @Test
     void buildsSafeNamedOracleProcedureCallSql() {
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("gl_proc");
-        job.setSourceType(SourceType.STORED_PROCEDURE);
-        job.setSchemaName("FIN_REPORTING");
-        job.setPackageName("PKG_SFG_EXPORTS");
-        job.setProcedureName("SP_EXPORT_DAILY_GL_JOURNALS");
-        job.setCursorParamName("P_RESULT_CURSOR");
-        Map<String, Object> params = new LinkedHashMap<>();
+        SequencedMap<String, Object> params = new LinkedHashMap<>();
         params.put("P_LOOKBACK_DAYS", 1);
         params.put("P_LEDGER_CODE", "CORP_US");
-        job.setParameters(params);
+
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("gl_proc")
+                .sourceType(SourceType.STORED_PROCEDURE)
+                .schemaName("FIN_REPORTING")
+                .packageName("PKG_SFG_EXPORTS")
+                .procedureName("SP_EXPORT_DAILY_GL_JOURNALS")
+                .cursorParamName("P_RESULT_CURSOR")
+                .parameters(params)
+                .build();
 
         String callSql = extractor.buildSafeProcedureCallSql(job);
         assertThat(callSql).isEqualTo(
@@ -157,6 +177,11 @@ class StreamingCsvWriterAndExtractorTest {
                         + "P_LOOKBACK_DAYS => ?, P_LEDGER_CODE => ?, P_RESULT_CURSOR => ?)}");
     }
 
+    /**
+     * Verifies OWASP CSV formula-injection neutralization: string cells starting with {@code =},
+     * {@code +}, {@code -}, {@code @}, or {@code \t} are prefixed with {@code '}, whereas numeric
+     * negative {@link BigDecimal} amounts remain unprefixed valid numbers.
+     */
     @Test
     void neutralizesCsvFormulaInjectionWhilePreservingNegativeBigDecimal() throws Exception {
         ResultSet rs = mock(ResultSet.class);
@@ -178,15 +203,21 @@ class StreamingCsvWriterAndExtractorTest {
         when(rs.getObject(5)).thenReturn("\tcmd");
         when(rs.getObject(6)).thenReturn(new BigDecimal("-123.45"));
 
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("formula_test");
-        job.setFilePrefix("FORMULA");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("formula_test")
+                .filePrefix("FORMULA")
+                .build();
 
         StreamingCsvWriter.StagedCsvFile staged = csvWriter.writeResultSet(rs, job);
         List<String> lines = Files.readAllLines(staged.filePath());
         assertThat(lines.get(1)).isEqualTo("'=SUM(A1),'+cmd,'-1+1,'@SUM(1+1),'\tcmd,-123.45");
     }
 
+    /**
+     * Verifies that POSIX {@code 0600} ({@code rw-------}) owner-only file permissions are enforced
+     * atomically at {@code .part} file creation time (eliminating any TOCTOU window) and preserved
+     * after promotion to {@code .csv}.
+     */
     @Test
     void enforcesPosix0600PermissionsDuringStreamingAndAfterPromotion() throws Exception {
         if (!FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
@@ -213,9 +244,10 @@ class StreamingCsvWriterAndExtractorTest {
         });
         when(rs.getObject(1)).thenReturn("VAL");
 
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("perm_test");
-        job.setFilePrefix("PERM_TEST");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("perm_test")
+                .filePrefix("PERM_TEST")
+                .build();
 
         StreamingCsvWriter.StagedCsvFile staged = csvWriter.writeResultSet(rs, job);
         assertThat(partHad0600).isTrue();
@@ -223,6 +255,10 @@ class StreamingCsvWriterAndExtractorTest {
                 .isEqualTo(PosixFilePermissions.fromString("rw-------"));
     }
 
+    /**
+     * Verifies OOM protection on oversized JDBC {@link Clob} columns: values exceeding
+     * {@code maxClobChars} are rejected and {@link Clob#free()} is still guaranteed to run in {@code finally}.
+     */
     @Test
     void rejectsOversizedClobAndFreesHandle() throws Exception {
         Clob clob = mock(Clob.class);
@@ -236,9 +272,10 @@ class StreamingCsvWriterAndExtractorTest {
         when(rs.next()).thenReturn(true, false);
         when(rs.getObject(1)).thenReturn(clob);
 
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("clob_limit");
-        job.setFilePrefix("CLOB_LIMIT");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("clob_limit")
+                .filePrefix("CLOB_LIMIT")
+                .build();
 
         assertThatThrownBy(() -> csvWriter.writeResultSet(rs, job))
                 .isInstanceOf(SQLException.class)
@@ -246,6 +283,11 @@ class StreamingCsvWriterAndExtractorTest {
         verify(clob).free();
     }
 
+    /**
+     * Verifies JDBC cursor/statement leak prevention: if parameter binding throws inside
+     * {@code CallableStatementCreator} before {@link JdbcTemplate} takes ownership, the
+     * {@link CallableStatement} is closed immediately.
+     */
     @Test
     void closesCallableStatementWhenParameterBindingThrows() throws Exception {
         DataSource mockDs = mock(DataSource.class);
@@ -257,18 +299,23 @@ class StreamingCsvWriterAndExtractorTest {
         doThrow(new SQLException("Invalid bind parameter")).when(mockCs).setObject(eq(1), any());
 
         OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("proc_bind_fail");
-        job.setSourceType(SourceType.STORED_PROCEDURE);
-        job.setProcedureName("SP_FAIL");
-        job.setParameters(Map.of("P_ID", "bad"));
-        job.setFilePrefix("PROC_FAIL");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("proc_bind_fail")
+                .sourceType(SourceType.STORED_PROCEDURE)
+                .procedureName("SP_FAIL")
+                .parameters(Map.of("P_ID", "bad"))
+                .filePrefix("PROC_FAIL")
+                .build();
 
         assertThatThrownBy(() -> mockExtractor.extractToCsv(job))
                 .isInstanceOf(DataAccessException.class);
         verify(mockCs).close();
     }
 
+    /**
+     * Verifies extended CSV formula-injection neutralization when formulas appear in column headers,
+     * after leading whitespace ({@code " =SUM(A1)"}), or after leading newlines ({@code "\n=CMD"}).
+     */
     @Test
     void neutralizesLeadingWhitespaceNewlineAndFormulaHeaders() throws Exception {
         ResultSet rs = mock(ResultSet.class);
@@ -284,16 +331,22 @@ class StreamingCsvWriterAndExtractorTest {
         when(rs.getObject(2)).thenReturn(" =SUM(A1)");
         when(rs.getObject(3)).thenReturn("\n=CMD");
 
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("ws_formula_test");
-        job.setFilePrefix("WS_FORMULA");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("ws_formula_test")
+                .filePrefix("WS_FORMULA")
+                .build();
 
         StreamingCsvWriter.StagedCsvFile staged = csvWriter.writeResultSet(rs, job);
         String content = Files.readString(staged.filePath());
-        assertThat(content).startsWith("'=HDR,SPACE_FORMULA,NEWLINE_FORMULA\n");
-        assertThat(content).contains("' =SUM(A1),\"'\n=CMD\"");
+        assertThat(content)
+                .startsWith("'=HDR,SPACE_FORMULA,NEWLINE_FORMULA\n")
+                .contains("' =SUM(A1),\"'\n=CMD\"");
     }
 
+    /**
+     * Verifies bounded {@link SQLXML} streaming (with formula neutralization and {@link SQLXML#free()}
+     * cleanup) as well as explicit rejection of binary {@link Blob} columns (freeing the {@link Blob} handle).
+     */
     @Test
     void readsSqlXmlBoundedAndRejectsBlobWhileFreeingResources() throws Exception {
         SQLXML sqlxml = mock(SQLXML.class);
@@ -307,12 +360,13 @@ class StreamingCsvWriterAndExtractorTest {
         when(xmlRs.next()).thenReturn(true, false);
         when(xmlRs.getObject(1)).thenReturn(sqlxml);
 
-        ExportJobConfig xmlJob = new ExportJobConfig();
-        xmlJob.setName("xml_test");
-        xmlJob.setFilePrefix("XML_TEST");
+        ExportJobConfig xmlJob = ExportJobConfig.builder()
+                .name("xml_test")
+                .filePrefix("XML_TEST")
+                .build();
 
         StreamingCsvWriter.StagedCsvFile staged = csvWriter.writeResultSet(xmlRs, xmlJob);
-        assertThat(Files.readAllLines(staged.filePath()).get(1)).isEqualTo("'=XML_FORMULA");
+        assertThat(Files.readAllLines(staged.filePath()).getLast()).isEqualTo("'=XML_FORMULA");
         verify(sqlxml).free();
 
         Blob blob = mock(Blob.class);
@@ -324,9 +378,10 @@ class StreamingCsvWriterAndExtractorTest {
         when(blobRs.next()).thenReturn(true, false);
         when(blobRs.getObject(1)).thenReturn(blob);
 
-        ExportJobConfig blobJob = new ExportJobConfig();
-        blobJob.setName("blob_test");
-        blobJob.setFilePrefix("BLOB_TEST");
+        ExportJobConfig blobJob = ExportJobConfig.builder()
+                .name("blob_test")
+                .filePrefix("BLOB_TEST")
+                .build();
 
         assertThatThrownBy(() -> csvWriter.writeResultSet(blobRs, blobJob))
                 .isInstanceOf(SQLException.class)
@@ -334,6 +389,10 @@ class StreamingCsvWriterAndExtractorTest {
         verify(blob).free();
     }
 
+    /**
+     * Verifies memory DoS protection when loading external {@code file:} SQL resources: files larger
+     * than 1 MiB are rejected before reading into memory or acquiring a database connection.
+     */
     @Test
     void rejectsOversizedExternalSqlFileBeforeExecution() throws Exception {
         Path oversizedSql = tempDir.resolve("huge.sql");
@@ -341,11 +400,12 @@ class StreamingCsvWriterAndExtractorTest {
 
         DataSource mockDs = mock(DataSource.class);
         OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("huge_sql");
-        job.setSourceType(SourceType.SQL_QUERY);
-        job.setSqlFile("file:" + oversizedSql.toAbsolutePath());
-        job.setFilePrefix("HUGE_SQL");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("huge_sql")
+                .sourceType(SourceType.SQL_QUERY)
+                .sqlFile("file:" + oversizedSql.toAbsolutePath())
+                .filePrefix("HUGE_SQL")
+                .build();
 
         assertThatThrownBy(() -> mockExtractor.extractToCsv(job))
                 .isInstanceOf(IllegalStateException.class)
@@ -353,6 +413,11 @@ class StreamingCsvWriterAndExtractorTest {
         verify(mockDs, never()).getConnection();
     }
 
+    /**
+     * Verifies JDBC statement leak prevention during {@code SQL_QUERY} preparation: if
+     * {@code setFetchSize} or {@code setQueryTimeout} throws before {@link JdbcTemplate} takes ownership,
+     * the {@link PreparedStatement} is closed immediately.
+     */
     @Test
     void closesPreparedStatementWhenSetFetchSizeThrowsDuringSqlQuery() throws Exception {
         DataSource mockDs = mock(DataSource.class);
@@ -364,15 +429,197 @@ class StreamingCsvWriterAndExtractorTest {
         doThrow(new SQLException("fetchSize unsupported")).when(mockPs).setFetchSize(anyInt());
 
         OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
-        ExportJobConfig job = new ExportJobConfig();
-        job.setName("sql_fetch_fail");
-        job.setSourceType(SourceType.SQL_QUERY);
-        job.setSqlFile("classpath:sql/test_export.sql");
-        job.setParameters(Map.of("status", "SETTLED"));
-        job.setFilePrefix("SQL_FETCH_FAIL");
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("sql_fetch_fail")
+                .sourceType(SourceType.SQL_QUERY)
+                .sqlFile("classpath:sql/test_export.sql")
+                .parameters(Map.of("status", "SETTLED"))
+                .filePrefix("SQL_FETCH_FAIL")
+                .build();
 
         assertThatThrownBy(() -> mockExtractor.extractToCsv(job))
                 .isInstanceOf(DataAccessException.class);
         verify(mockPs).close();
+    }
+
+    /**
+     * Verifies that JDBC {@code DATE}, {@code TIME}, and {@code TIMESTAMP} columns (plus {@code NULL}s)
+     * are extracted directly as {@code java.time} types via JDBC 4.2 {@code ResultSet.getObject(int, Class)}
+     * and formatted cleanly as ISO-8601 values without using legacy {@code java.util.Date}/{@code java.sql.Date}.
+     */
+    @Test
+    void streamsJdbcDateTimeColumnsUsingJavaTimeApi() throws Exception {
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("""
+                CREATE TABLE test_dates (
+                    d DATE,
+                    t TIME,
+                    ts TIMESTAMP
+                )
+                """);
+        jdbc.update("INSERT INTO test_dates VALUES (DATE '2026-11-22', TIME '06:15:30', TIMESTAMP '2026-11-22 06:15:30')");
+        jdbc.update("INSERT INTO test_dates VALUES (NULL, NULL, NULL)");
+
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("datetime_test")
+                .filePrefix("DATETIME_TEST")
+                .build();
+
+        StreamingCsvWriter.StagedCsvFile staged;
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT d, t, ts FROM test_dates")) {
+            staged = csvWriter.writeResultSet(rs, job);
+        }
+
+        List<String> lines = Files.readAllLines(staged.filePath());
+        assertThat(lines).containsExactly(
+                "D,T,TS",
+                "2026-11-22,06:15:30,2026-11-22T06:15:30",
+                ",,");
+    }
+
+    /**
+     * Verifies the full {@code STORED_PROCEDURE} happy path ({@code CallableStatement} execution,
+     * {@code Types.REF_CURSOR} registration, {@code fetchSize} propagation on the cursor, CSV streaming,
+     * and deterministic closing of cursor/statement) as well as rejection when the procedure returns
+     * a {@code null} {@code SYS_REFCURSOR}.
+     */
+    @Test
+    void streamsStoredProcedureCursorAndRejectsNullRefCursor() throws Exception {
+        DataSource mockDs = mock(DataSource.class);
+        Connection mockConn = mock(Connection.class);
+        CallableStatement mockCs = mock(CallableStatement.class);
+        ResultSet mockRs = mock(ResultSet.class);
+        ResultSetMetaData mockMeta = mock(ResultSetMetaData.class);
+
+        when(mockDs.getConnection()).thenReturn(mockConn);
+        when(mockConn.prepareCall(anyString(), eq(ResultSet.TYPE_FORWARD_ONLY), eq(ResultSet.CONCUR_READ_ONLY)))
+                .thenReturn(mockCs);
+        when(mockCs.getObject(2, ResultSet.class)).thenReturn(mockRs);
+        when(mockRs.getMetaData()).thenReturn(mockMeta);
+        when(mockMeta.getColumnCount()).thenReturn(2);
+        when(mockMeta.getColumnLabel(1)).thenReturn("JOURNAL_ID");
+        when(mockMeta.getColumnLabel(2)).thenReturn("MEMO");
+
+        Clob smallClob = mock(Clob.class);
+        when(smallClob.length()).thenReturn(8L);
+        when(smallClob.getSubString(1L, 8)).thenReturn("GL_ENTRY");
+
+        when(mockRs.next()).thenReturn(true, false);
+        when(mockRs.getObject(1)).thenReturn(101L);
+        when(mockRs.getObject(2)).thenReturn(smallClob);
+
+        OracleDataExtractor procExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        ExportJobConfig job = ExportJobConfig.builder()
+                .name("gl_proc_ok")
+                .sourceType(SourceType.STORED_PROCEDURE)
+                .schemaName("FIN")
+                .packageName("PKG_GL")
+                .procedureName("SP_EXPORT")
+                .cursorParamName("P_OUT")
+                .parameters(Map.of("P_DAYS", 1))
+                .fetchSize(500)
+                .queryTimeoutSeconds(120)
+                .filePrefix("PROC_OK")
+                .build();
+
+        StreamingCsvWriter.StagedCsvFile staged = procExtractor.extractToCsv(job);
+
+        assertThat(staged.hasFile()).isTrue();
+        assertThat(staged.rowCount()).isEqualTo(1L);
+        assertThat(Files.readAllLines(staged.filePath()))
+                .containsExactly("JOURNAL_ID,MEMO", "101,GL_ENTRY");
+        verify(mockCs).registerOutParameter(2, Types.REF_CURSOR);
+        verify(mockRs).setFetchSize(500);
+        verify(smallClob).free();
+        verify(mockRs).close();
+        verify(mockCs).close();
+
+        // Now simulate a stored procedure returning a null SYS_REFCURSOR
+        when(mockCs.getObject(2, ResultSet.class)).thenReturn(null);
+        assertThatThrownBy(() -> procExtractor.extractToCsv(job))
+                .isInstanceOf(DataAccessException.class)
+                .hasMessageContaining("null SYS_REFCURSOR");
+    }
+
+    /**
+     * Verifies that {@link OracleDataExtractor} strips a trailing semicolon ({@code ;}) from external
+     * {@code .sql} files (which Oracle JDBC otherwise rejects) and fails fast on blank/whitespace-only SQL files.
+     */
+    @Test
+    void stripsTrailingSemicolonInSqlFileAndRejectsBlankSqlFile() throws Exception {
+        Path semicolonSql = Files.writeString(
+                tempDir.resolve("with_semicolon.sql"),
+                "  SELECT id, account_code FROM test_transactions WHERE status = :status;  \n");
+        ExportJobConfig okJob = ExportJobConfig.builder()
+                .name("semi_sql")
+                .sourceType(SourceType.SQL_QUERY)
+                .sqlFile("file:" + semicolonSql.toAbsolutePath())
+                .parameters(Map.of("status", "PENDING"))
+                .filePrefix("SEMI_SQL")
+                .build();
+
+        StreamingCsvWriter.StagedCsvFile result = extractor.extractToCsv(okJob);
+        assertThat(result.rowCount()).isEqualTo(1L);
+        assertThat(Files.readAllLines(result.filePath()))
+                .containsExactly("ID,ACCOUNT_CODE", "4,ACC_400");
+
+        Path emptySql = Files.writeString(tempDir.resolve("blank.sql"), "   \n\t  ");
+        ExportJobConfig emptySqlJob = ExportJobConfig.builder()
+                .name("blank_sql")
+                .sourceType(SourceType.SQL_QUERY)
+                .sqlFile("file:" + emptySql.toAbsolutePath())
+                .filePrefix("BLANK_SQL")
+                .build();
+
+        assertThatThrownBy(() -> extractor.extractToCsv(emptySqlJob))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("empty");
+    }
+
+    /**
+     * Verifies atomic local staging guarantees: if {@link ResultSet#next()} throws mid-stream,
+     * the temporary {@code .part} file is deleted in {@code finally} leaving zero orphan files;
+     * and when 0 rows are returned with {@code write-empty-file=true}, a header-only CSV is promoted cleanly.
+     */
+    @Test
+    void deletesLocalPartFileOnMidStreamFailureAndWritesHeaderOnlyCsvWhenConfigured() throws Exception {
+        ResultSet failingRs = mock(ResultSet.class);
+        ResultSetMetaData meta = mock(ResultSetMetaData.class);
+        when(failingRs.getMetaData()).thenReturn(meta);
+        when(meta.getColumnCount()).thenReturn(1);
+        when(meta.getColumnLabel(1)).thenReturn("COL1");
+        when(failingRs.next()).thenReturn(true).thenThrow(new SQLException("ORA-01555 snapshot too old"));
+        when(failingRs.getObject(1)).thenReturn("ROW_1");
+
+        ExportJobConfig failJob = ExportJobConfig.builder()
+                .name("midstream_fail")
+                .filePrefix("MIDSTREAM_FAIL")
+                .build();
+
+        assertThatThrownBy(() -> csvWriter.writeResultSet(failingRs, failJob))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("ORA-01555");
+
+        try (Stream<Path> remaining = Files.list(stagingDir)) {
+            assertThat(remaining.toList()).isEmpty();
+        }
+
+        // Verify write-empty-file=true produces a header-only CSV with 0 data rows
+        ResultSet emptyRs = mock(ResultSet.class);
+        when(emptyRs.getMetaData()).thenReturn(meta);
+        when(emptyRs.next()).thenReturn(false);
+
+        ExportJobConfig headerOnlyJob = ExportJobConfig.builder()
+                .name("header_only")
+                .filePrefix("HEADER_ONLY")
+                .csv(CsvOptions.builder().writeEmptyFile(true).quoteChar("").build())
+                .build();
+
+        StreamingCsvWriter.StagedCsvFile headerOnly = csvWriter.writeResultSet(emptyRs, headerOnlyJob);
+        assertThat(headerOnly.hasFile()).isTrue();
+        assertThat(headerOnly.rowCount()).isZero();
+        assertThat(Files.readAllLines(headerOnly.filePath())).containsExactly("COL1");
     }
 }
