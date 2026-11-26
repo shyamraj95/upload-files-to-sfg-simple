@@ -14,8 +14,11 @@ import org.springframework.core.io.ResourceLoader;
 import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -88,10 +91,12 @@ public class SecurityValidator implements InitializingBean {
         validateScheduler(props.getScheduler());
 
         Set<String> seenJobNames = new HashSet<>();
+        Set<String> seenFilePrefixes = new HashSet<>();
         Set<String> referencedTargets = new HashSet<>();
+        String allowedSqlDir = props.getStorage().getSqlDir();
 
         for (ExportJobConfig job : props.getJobs()) {
-            validateJob(job, props.getSftpTargets(), seenJobNames);
+            validateJob(job, props.getSftpTargets(), seenJobNames, seenFilePrefixes, allowedSqlDir);
             if (job.isEnabled()) {
                 referencedTargets.add(job.getSftpTarget());
             }
@@ -99,16 +104,15 @@ public class SecurityValidator implements InitializingBean {
 
         // Validate every SFTP target that is actively referenced by at least one enabled job
         for (String targetKey : referencedTargets) {
-            validateSftpTarget(targetKey, props.getSftpTargets().get(targetKey));
+            validateSftpTarget(targetKey, props.getSftpTargets().get(targetKey), props.isAllowInsecureSftpDevMode());
         }
     }
 
     private void validateStorage(AppProperties.StorageConfig storage) {
         requireNonBlank(storage.getStagingDir(), "app.storage.staging-dir");
         requireNonBlank(storage.getBackupDir(), "app.storage.backup-dir");
-        if (storage.getRetentionDays() < 1) {
-            throw new IllegalArgumentException("app.storage.retention-days must be >= 1");
-        }
+        requireMin(storage.getRetentionDays(), 1, "app.storage.retention-days");
+        requireMin(storage.getStagingPartMaxAgeHours(), 1, "app.storage.staging-part-max-age-hours");
         validateCron(storage.getCleanupCron(), "app.storage.cleanup-cron");
         validateTimeZone(storage.getCleanupTimeZone(), "app.storage.cleanup-time-zone");
     }
@@ -125,7 +129,9 @@ public class SecurityValidator implements InitializingBean {
     public void validateJob(
             ExportJobConfig job,
             Map<String, SftpTargetConfig> sftpTargets,
-            Set<String> seenJobNames
+            Set<String> seenJobNames,
+            Set<String> seenFilePrefixes,
+            String allowedSqlDir
     ) {
         validateIdentifier(job.getName(), "job.name");
         if (!seenJobNames.add(job.getName())) {
@@ -134,6 +140,10 @@ public class SecurityValidator implements InitializingBean {
 
         String prefix = "app.jobs[" + job.getName() + "]";
         validateIdentifier(job.getFilePrefix(), prefix + ".file-prefix");
+        if (!seenFilePrefixes.add(job.getFilePrefix())) {
+            throw new IllegalArgumentException(
+                    "Duplicate file-prefix '" + job.getFilePrefix() + "' configured across jobs");
+        }
         validateCron(job.getCron(), prefix + ".cron");
         validateTimeZone(job.getTimeZone(), prefix + ".time-zone");
         validateTimestampPattern(job.getTimestampPattern(), prefix + ".timestamp-pattern");
@@ -141,7 +151,7 @@ public class SecurityValidator implements InitializingBean {
         requireMin(job.getFetchSize(), 1, prefix + ".fetch-size");
         requireMin(job.getQueryTimeoutSeconds(), 1, prefix + ".query-timeout-seconds");
 
-        validateJobSource(job, prefix);
+        validateJobSource(job, prefix, allowedSqlDir);
 
         for (String paramName : job.getParameters().keySet()) {
             validateIdentifier(paramName, prefix + ".parameters key");
@@ -160,30 +170,41 @@ public class SecurityValidator implements InitializingBean {
         }
     }
 
-    private void validateJobSource(ExportJobConfig job, String prefix) {
+    private void validateJobSource(ExportJobConfig job, String prefix, String allowedSqlDir) {
         if (job.getSourceType() == null) {
             throw new IllegalArgumentException(prefix + ".source-type must be STORED_PROCEDURE or SQL_QUERY");
         }
 
         if (job.getSourceType() == SourceType.STORED_PROCEDURE) {
-            if (isNotBlank(job.getSchemaName())) {
-                validateIdentifier(job.getSchemaName(), prefix + ".schema-name");
-            }
-            if (isNotBlank(job.getPackageName())) {
-                validateIdentifier(job.getPackageName(), prefix + ".package-name");
-            }
-            validateIdentifier(job.getProcedureName(), prefix + ".procedure-name");
-            validateIdentifier(job.getCursorParamName(), prefix + ".cursor-param-name");
+            validateStoredProcedureSource(job, prefix);
         } else if (job.getSourceType() == SourceType.SQL_QUERY) {
-            validateSqlFileLocation(job.getSqlFile(), prefix + ".sql-file");
-            if (job.isEnabled() && !resourceLoader.getResource(job.getSqlFile()).exists()) {
-                throw new IllegalArgumentException(
-                        prefix + ".sql-file resource does not exist: " + job.getSqlFile());
-            }
+            validateSqlQuerySource(job, prefix, allowedSqlDir);
         }
     }
 
-    public void validateSftpTarget(String targetKey, SftpTargetConfig target) {
+    private void validateStoredProcedureSource(ExportJobConfig job, String prefix) {
+        if (isNotBlank(job.getSchemaName())) {
+            validateIdentifier(job.getSchemaName(), prefix + ".schema-name");
+        }
+        if (isNotBlank(job.getPackageName())) {
+            validateIdentifier(job.getPackageName(), prefix + ".package-name");
+        }
+        validateIdentifier(job.getProcedureName(), prefix + ".procedure-name");
+        validateIdentifier(job.getCursorParamName(), prefix + ".cursor-param-name");
+    }
+
+    private void validateSqlQuerySource(ExportJobConfig job, String prefix, String allowedSqlDir) {
+        validateSqlFileLocation(job.getSqlFile(), prefix + ".sql-file");
+        if (job.isEnabled() && !resourceLoader.getResource(job.getSqlFile()).exists()) {
+            throw new IllegalArgumentException(
+                    prefix + ".sql-file resource does not exist: " + job.getSqlFile());
+        }
+        if (job.isEnabled() && job.getSqlFile().startsWith("file:")) {
+            validateExternalSqlFileSecurity(job.getSqlFile(), allowedSqlDir);
+        }
+    }
+
+    public void validateSftpTarget(String targetKey, SftpTargetConfig target, boolean allowInsecureSftpDevMode) {
         String prefix = "app.sftp-targets." + targetKey;
         if (target == null) {
             throw new IllegalArgumentException(prefix + " must not be null");
@@ -194,7 +215,7 @@ public class SecurityValidator implements InitializingBean {
         }
         requireNonBlank(target.getUsername(), prefix + ".username");
 
-        validateSftpSecuritySettings(targetKey, target, prefix);
+        validateSftpSecuritySettings(targetKey, target, prefix, allowInsecureSftpDevMode);
 
         if (!isNotBlank(target.getTempSuffix()) || !SAFE_TEMP_SUFFIX_PATTERN.matcher(target.getTempSuffix()).matches()) {
             throw new IllegalArgumentException(
@@ -209,10 +230,16 @@ public class SecurityValidator implements InitializingBean {
             throw new IllegalArgumentException(prefix + " timeouts must be >= 1000 ms");
         }
 
+        requireMin(target.getMaxConcurrentUploads(), 1, prefix + ".max-concurrent-uploads");
         validateRetryConfig(target.getRetry(), prefix + ".retry");
     }
 
-    private void validateSftpSecuritySettings(String targetKey, SftpTargetConfig target, String prefix) {
+    private void validateSftpSecuritySettings(
+            String targetKey,
+            SftpTargetConfig target,
+            String prefix,
+            boolean allowInsecureSftpDevMode
+    ) {
         if (!target.hasPrivateKeyAuth() && !target.hasPasswordAuth()) {
             throw new IllegalArgumentException(
                     prefix + " must configure either private-key-path (preferred) or password via environment variables");
@@ -221,8 +248,11 @@ public class SecurityValidator implements InitializingBean {
         if (target.isStrictHostKeyChecking()) {
             requireNonBlank(target.getKnownHostsPath(),
                     prefix + ".known-hosts-path (required when strict-host-key-checking=true)");
+        } else if (!allowInsecureSftpDevMode) {
+            throw new IllegalArgumentException(
+                    prefix + ".strict-host-key-checking=false is prohibited unless app.allow-insecure-sftp-dev-mode=true");
         } else {
-            log.warn("SECURITY WARNING: strict-host-key-checking is disabled for SFTP target '{}'. "
+            log.warn("SECURITY WARNING: strict-host-key-checking is disabled for SFTP target '{}' (dev mode opt-in active). "
                     + "Do NOT disable host key verification in production!", targetKey);
         }
 
@@ -262,6 +292,7 @@ public class SecurityValidator implements InitializingBean {
         if (!Charset.isSupported(csv.getCharset())) {
             throw new IllegalArgumentException(prefix + ".charset is not supported: " + csv.getCharset());
         }
+        requireMin(csv.getMaxClobChars(), 1, prefix + ".max-clob-chars");
     }
 
     private void validateTimestampPattern(String pattern, String fieldName) {
@@ -318,12 +349,43 @@ public class SecurityValidator implements InitializingBean {
     }
 
     /**
-     * Defense-in-depth check ensuring a resolved local path stays strictly inside its base directory.
+     * Enforces base-directory confinement (when {@code allowedSqlDir} is configured) and rejects
+     * world-writable external {@code file:} SQL resources to mitigate runtime SQL tampering.
+     */
+    public static void validateExternalSqlFileSecurity(String fileResourceUri, String allowedSqlDir) {
+        Path rawPath = Path.of(fileResourceUri.substring("file:".length()));
+        try {
+            Path realSqlPath = rawPath.toRealPath();
+            if (isNotBlank(allowedSqlDir)) {
+                Path realSqlDir = Path.of(allowedSqlDir).toRealPath();
+                ensureChildPath(realSqlDir, realSqlPath);
+            }
+            rejectWorldWritable(realSqlPath);
+        } catch (IOException ex) {
+            throw new IllegalArgumentException(
+                    "Unable to verify external SQL file security for '" + fileResourceUri + "': " + ex.getMessage(), ex);
+        }
+    }
+
+    private static void rejectWorldWritable(Path path) throws IOException {
+        try {
+            Set<PosixFilePermission> perms = Files.getPosixFilePermissions(path);
+            if (perms.contains(PosixFilePermission.OTHERS_WRITE)) {
+                throw new SecurityException("Refusing to execute world-writable SQL file: " + path.getFileName());
+            }
+        } catch (UnsupportedOperationException ignored) {
+            // Non-POSIX filesystem
+        }
+    }
+
+    /**
+     * Defense-in-depth check ensuring a resolved local path stays strictly inside its base directory
+     * (rejecting both escaping paths and the base directory itself).
      */
     public static Path ensureChildPath(Path baseDir, Path candidate) {
         Path normalizedBase = baseDir.toAbsolutePath().normalize();
         Path normalizedCandidate = candidate.toAbsolutePath().normalize();
-        if (!normalizedCandidate.startsWith(normalizedBase)) {
+        if (normalizedCandidate.equals(normalizedBase) || !normalizedCandidate.startsWith(normalizedBase)) {
             throw new SecurityException(
                     "Path traversal attempt detected: resolved path escapes base directory");
         }

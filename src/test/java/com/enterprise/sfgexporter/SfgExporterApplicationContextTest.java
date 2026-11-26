@@ -1,17 +1,20 @@
 package com.enterprise.sfgexporter;
 
-import com.enterprise.sfgexporter.backup.BackupRetentionService;
 import com.enterprise.sfgexporter.config.AppProperties;
 import com.enterprise.sfgexporter.csv.StreamingCsvWriter;
 import com.enterprise.sfgexporter.db.OracleDataExtractor;
+import com.enterprise.sfgexporter.scheduler.BackupRetentionService;
 import com.enterprise.sfgexporter.scheduler.DynamicJobScheduler;
 import com.enterprise.sfgexporter.scheduler.ExportJobOrchestrator;
 import com.enterprise.sfgexporter.scheduler.ExportJobsHealthIndicator;
 import com.enterprise.sfgexporter.sftp.AtomicSftpUploader;
+import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.health.contributor.Status;
 import org.springframework.boot.test.context.SpringBootTest;
+
+import javax.sql.DataSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -58,6 +61,9 @@ class SfgExporterApplicationContextTest {
     @Autowired
     private ExportJobsHealthIndicator healthIndicator;
 
+    @Autowired
+    private DataSource dataSource;
+
     @Test
     void contextLoadsAndHealthIndicatorIsUp() {
         assertThat(csvWriter).isNotNull();
@@ -69,6 +75,10 @@ class SfgExporterApplicationContextTest {
         assertThat(appProperties.getSftpTargets()).containsKeys("sfg-primary", "sfg-partner-b");
         assertThat(appProperties.getJobs().getFirst().getParameters())
                 .containsKeys("P_LOOKBACK_DAYS", "P_LEDGER_CODE");
+        assertThat(dataSource).isInstanceOf(HikariDataSource.class);
+        HikariDataSource hikari = (HikariDataSource) dataSource;
+        assertThat(hikari.getDataSourceProperties().get("oracle.jdbc.ReadTimeout")).hasToString("300000");
+        assertThat(hikari.getDataSourceProperties().get("oracle.net.CONNECT_TIMEOUT")).hasToString("15000");
         assertThat(healthIndicator.health().getStatus()).isEqualTo(Status.UP);
     }
 }

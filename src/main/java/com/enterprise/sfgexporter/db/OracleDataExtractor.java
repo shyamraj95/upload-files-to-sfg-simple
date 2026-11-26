@@ -1,11 +1,13 @@
 package com.enterprise.sfgexporter.db;
 
+import com.enterprise.sfgexporter.config.AppProperties;
 import com.enterprise.sfgexporter.config.SecurityValidator;
 import com.enterprise.sfgexporter.csv.StreamingCsvWriter;
 import com.enterprise.sfgexporter.model.ExportJobConfig;
 import com.enterprise.sfgexporter.model.SourceType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.dao.DataRetrievalFailureException;
@@ -14,6 +16,7 @@ import org.springframework.jdbc.core.CallableStatementCreator;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.jdbc.support.JdbcUtils;
 import org.springframework.stereotype.Component;
 
 import javax.sql.DataSource;
@@ -28,13 +31,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Executes configured Oracle PL/SQL stored procedures ({@code SYS_REFCURSOR}) or parameterized
  * SQL query files and streams the {@link ResultSet} directly into {@link StreamingCsvWriter}.
  *
- * <p>Uses {@link JdbcTemplate#execute(CallableStatementCreator, CallableStatementCallback)} and
- * {@link NamedParameterJdbcTemplate#query(String, org.springframework.jdbc.core.namedparam.SqlParameterSource, org.springframework.jdbc.core.ResultSetExtractor)}
+ * <p>Uses {@link JdbcTemplate execute(CallableStatementCreator, CallableStatementCallback)} and
+ * {@link NamedParameterJdbcTemplate query(String, org.springframework.jdbc.core.namedparam.SqlParameterSource, org.springframework.jdbc.core.ResultSetExtractor)}
  * rather than collecting rows into memory, keeping memory consumption constant even for large extracts.</p>
  */
 @Component
@@ -45,15 +49,37 @@ public class OracleDataExtractor {
     private final DataSource dataSource;
     private final ResourceLoader resourceLoader;
     private final StreamingCsvWriter csvWriter;
+    private final String allowedSqlDir;
+    private final Map<String, NamedParameterJdbcTemplate> namedTemplates = new ConcurrentHashMap<>();
 
+    @Autowired
     public OracleDataExtractor(
+            DataSource dataSource,
+            ResourceLoader resourceLoader,
+            StreamingCsvWriter csvWriter,
+            AppProperties properties
+    ) {
+        this(dataSource, resourceLoader, csvWriter, properties.getStorage().getSqlDir());
+    }
+
+    OracleDataExtractor(
             DataSource dataSource,
             ResourceLoader resourceLoader,
             StreamingCsvWriter csvWriter
     ) {
+        this(dataSource, resourceLoader, csvWriter, "");
+    }
+
+    private OracleDataExtractor(
+            DataSource dataSource,
+            ResourceLoader resourceLoader,
+            StreamingCsvWriter csvWriter,
+            String allowedSqlDir
+    ) {
         this.dataSource = dataSource;
         this.resourceLoader = resourceLoader;
         this.csvWriter = csvWriter;
+        this.allowedSqlDir = allowedSqlDir != null ? allowedSqlDir : "";
     }
 
     /**
@@ -95,15 +121,21 @@ public class OracleDataExtractor {
             // Forward-only, read-only cursor avoids scrollable buffer overhead inside Oracle JDBC
             CallableStatement cs = connection.prepareCall(
                     callSql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
-            cs.setFetchSize(job.getFetchSize());
-            cs.setQueryTimeout(job.getQueryTimeoutSeconds());
+            try {
+                cs.setFetchSize(job.getFetchSize());
+                cs.setQueryTimeout(job.getQueryTimeoutSeconds());
 
-            for (int i = 0; i < inParams.size(); i++) {
-                cs.setObject(i + 1, inParams.get(i).getValue());
+                for (int i = 0; i < inParams.size(); i++) {
+                    cs.setObject(i + 1, inParams.get(i).getValue());
+                }
+                // Standard JDBC 4.2 Types.REF_CURSOR is natively supported by ojdbc11 for Oracle SYS_REFCURSOR
+                cs.registerOutParameter(cursorParamIndex, Types.REF_CURSOR);
+                return cs;
+            } catch (SQLException | RuntimeException ex) {
+                // Close statement immediately if binding throws before JdbcTemplate can take ownership
+                JdbcUtils.closeStatement(cs);
+                throw ex;
             }
-            // Standard JDBC 4.2 Types.REF_CURSOR is natively supported by ojdbc11 for Oracle SYS_REFCURSOR
-            cs.registerOutParameter(cursorParamIndex, Types.REF_CURSOR);
-            return cs;
         };
 
         CallableStatementCallback<StreamingCsvWriter.StagedCsvFile> callback = cs -> {
@@ -134,8 +166,8 @@ public class OracleDataExtractor {
         log.info("Executing parameterized SQL file '{}' for job '{}' (fetchSize={}, timeout={}s)",
                 job.getSqlFile(), job.getName(), job.getFetchSize(), job.getQueryTimeoutSeconds());
 
-        JdbcTemplate jobJdbcTemplate = createJobJdbcTemplate(job);
-        NamedParameterJdbcTemplate namedJdbc = new NamedParameterJdbcTemplate(jobJdbcTemplate);
+        NamedParameterJdbcTemplate namedJdbc = namedTemplates.computeIfAbsent(
+                job.getName(), ignored -> new NamedParameterJdbcTemplate(createJobJdbcTemplate(job)));
 
         MapSqlParameterSource paramSource = new MapSqlParameterSource();
         for (Map.Entry<String, Object> entry : job.getParameters().entrySet()) {
@@ -194,6 +226,9 @@ public class OracleDataExtractor {
     }
 
     private String loadSqlResource(String location) {
+        if (location.startsWith("file:")) {
+            SecurityValidator.validateExternalSqlFileSecurity(location, allowedSqlDir);
+        }
         Resource resource = resourceLoader.getResource(location);
         if (!resource.exists()) {
             throw new IllegalStateException("SQL resource not found: " + location);

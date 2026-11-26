@@ -32,6 +32,16 @@ public class CsvOptions {
      */
     private boolean writeEmptyFile = true;
 
+    /**
+     * Prefixes non-numeric text/CLOB cells starting with spreadsheet formula triggers
+     * ({@code =}, {@code +}, {@code -}, {@code @}, {@code \t}, {@code \r}) with {@code '} to prevent
+     * CSV formula injection in Excel/Calc (negative numeric {@code BigDecimal} values are never altered).
+     */
+    private boolean neutralizeFormulas = true;
+
+    /** Maximum permitted character length for a single Oracle {@code CLOB} cell to bound heap usage (default: 1,048,576). */
+    private int maxClobChars = 1_048_576;
+
     public String getDelimiter() {
         return delimiter;
     }
@@ -90,5 +100,21 @@ public class CsvOptions {
 
     public void setWriteEmptyFile(boolean writeEmptyFile) {
         this.writeEmptyFile = writeEmptyFile;
+    }
+
+    public boolean isNeutralizeFormulas() {
+        return neutralizeFormulas;
+    }
+
+    public void setNeutralizeFormulas(boolean neutralizeFormulas) {
+        this.neutralizeFormulas = neutralizeFormulas;
+    }
+
+    public int getMaxClobChars() {
+        return maxClobChars;
+    }
+
+    public void setMaxClobChars(int maxClobChars) {
+        this.maxClobChars = maxClobChars;
     }
 }

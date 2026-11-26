@@ -22,11 +22,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -53,35 +56,59 @@ public class SshClientFactory {
 
     public SshClient createHardenedClient(String targetKey, SftpTargetConfig config) {
         SshClient client = SshClient.setUpDefaultClient();
+        try {
+            // 1. Restrict ciphers, KEX, and MACs to configured modern strong algorithms
+            client.setCipherFactories(resolveCiphers(targetKey, config.getAllowedCiphers()));
+            client.setKeyExchangeFactories(resolveKeyExchanges(targetKey, config.getAllowedKeyExchanges()));
+            client.setMacFactories(resolveMacs(targetKey, config.getAllowedMacs()));
 
-        // 1. Restrict ciphers, KEX, and MACs to configured modern strong algorithms
-        client.setCipherFactories(resolveCiphers(targetKey, config.getAllowedCiphers()));
-        client.setKeyExchangeFactories(resolveKeyExchanges(targetKey, config.getAllowedKeyExchanges()));
-        client.setMacFactories(resolveMacs(targetKey, config.getAllowedMacs()));
-
-        // 2. Enforce strict host key verification via server-mounted known_hosts
-        if (config.isStrictHostKeyChecking()) {
-            Path knownHostsPath = Path.of(config.getKnownHostsPath()).toAbsolutePath().normalize();
-            if (!Files.isRegularFile(knownHostsPath) || !Files.isReadable(knownHostsPath)) {
-                throw new IllegalStateException(
-                        "Cannot initialize SFTP target '" + targetKey
-                                + "': known_hosts file does not exist or is not readable at " + knownHostsPath);
+            // 2. Enforce strict host key verification via server-mounted known_hosts
+            if (config.isStrictHostKeyChecking()) {
+                Path knownHostsPath = Path.of(config.getKnownHostsPath()).toAbsolutePath().normalize();
+                if (!Files.isRegularFile(knownHostsPath) || !Files.isReadable(knownHostsPath)) {
+                    throw new IllegalStateException(
+                            "Cannot initialize SFTP target '" + targetKey
+                                    + "': known_hosts file does not exist or is not readable at " + knownHostsPath);
+                }
+                // RejectAllServerKeyVerifier delegate guarantees unknown hosts are rejected
+                client.setServerKeyVerifier(
+                        new KnownHostsServerKeyVerifier(RejectAllServerKeyVerifier.INSTANCE, knownHostsPath));
+            } else {
+                log.warn("SFTP target '{}' configured with strictHostKeyChecking=false (non-production mode)", targetKey);
+                client.setServerKeyVerifier(AcceptAllServerKeyVerifier.INSTANCE);
             }
-            // RejectAllServerKeyVerifier delegate guarantees unknown hosts are rejected
-            client.setServerKeyVerifier(
-                    new KnownHostsServerKeyVerifier(RejectAllServerKeyVerifier.INSTANCE, knownHostsPath));
-        } else {
-            log.warn("SFTP target '{}' configured with strictHostKeyChecking=false (non-production mode)", targetKey);
-            client.setServerKeyVerifier(AcceptAllServerKeyVerifier.INSTANCE);
-        }
 
-        // 3. Configure authentication strictly on the external SshClient (SSH private key preferred)
+            // 3. Configure authentication strictly on the external SshClient (SSH private key preferred)
+            configureAuthentication(client, targetKey, config);
+
+            // 4. Configure deterministic network and authentication timeouts
+            CoreModuleProperties.IO_CONNECT_TIMEOUT.set(client, Duration.ofMillis(config.getConnectTimeoutMs()));
+            CoreModuleProperties.AUTH_TIMEOUT.set(client, Duration.ofMillis(config.getAuthTimeoutMs()));
+            CoreModuleProperties.IDLE_TIMEOUT.set(
+                    client, Duration.ofMillis(Math.max(config.getChannelOpenTimeoutMs() * 2L, 30_000L)));
+
+            client.start();
+            // Release plaintext credential references from the config object once absorbed by SshClient
+            config.clearSecrets();
+            log.info("Started hardened SshClient for target '{}' (host={}:{}, strictHostKeyChecking={})",
+                    targetKey, config.getHost(), config.getPort(), config.isStrictHostKeyChecking());
+            return client;
+        } catch (RuntimeException ex) {
+            if (client.isStarted()) {
+                client.stop();
+            }
+            throw ex;
+        }
+    }
+
+    private void configureAuthentication(SshClient client, String targetKey, SftpTargetConfig config) {
         if (config.hasPrivateKeyAuth()) {
             Path keyPath = Path.of(config.getPrivateKeyPath()).toAbsolutePath().normalize();
             if (!Files.isRegularFile(keyPath) || !Files.isReadable(keyPath)) {
                 throw new IllegalStateException(
                         "SSH private key for target '" + targetKey + "' does not exist or is not readable: " + keyPath);
             }
+            enforcePrivateKeyPermissions(keyPath, targetKey);
             FileKeyPairProvider keyPairProvider = new FileKeyPairProvider(keyPath);
             if (config.getPrivateKeyPassphrase() != null && !config.getPrivateKeyPassphrase().isEmpty()) {
                 keyPairProvider.setPasswordFinder(FilePasswordProvider.of(config.getPrivateKeyPassphrase()));
@@ -96,17 +123,27 @@ public class SshClientFactory {
         } else {
             throw new IllegalStateException("No authentication method configured for SFTP target '" + targetKey + "'");
         }
+    }
 
-        // 4. Configure deterministic network and authentication timeouts
-        CoreModuleProperties.IO_CONNECT_TIMEOUT.set(client, Duration.ofMillis(config.getConnectTimeoutMs()));
-        CoreModuleProperties.AUTH_TIMEOUT.set(client, Duration.ofMillis(config.getAuthTimeoutMs()));
-        CoreModuleProperties.IDLE_TIMEOUT.set(
-                client, Duration.ofMillis(Math.max(config.getChannelOpenTimeoutMs() * 2L, 30_000L)));
-
-        client.start();
-        log.info("Started hardened SshClient for target '{}' (host={}:{}, strictHostKeyChecking={})",
-                targetKey, config.getHost(), config.getPort(), config.isStrictHostKeyChecking());
-        return client;
+    private void enforcePrivateKeyPermissions(Path keyPath, String targetKey) {
+        try {
+            Set<PosixFilePermission> perms = Files.getPosixFilePermissions(keyPath);
+            if (perms.contains(PosixFilePermission.GROUP_READ)
+                    || perms.contains(PosixFilePermission.GROUP_WRITE)
+                    || perms.contains(PosixFilePermission.GROUP_EXECUTE)
+                    || perms.contains(PosixFilePermission.OTHERS_READ)
+                    || perms.contains(PosixFilePermission.OTHERS_WRITE)
+                    || perms.contains(PosixFilePermission.OTHERS_EXECUTE)) {
+                throw new IllegalStateException(
+                        "SSH private key permissions for target '" + targetKey
+                                + "' are too open (require 0600): " + keyPath);
+            }
+        } catch (UnsupportedOperationException ignored) {
+            // Non-POSIX filesystem
+        } catch (IOException ex) {
+            throw new IllegalStateException(
+                    "Unable to inspect SSH private key permissions for target '" + targetKey + "'", ex);
+        }
     }
 
     private List<NamedFactory<Cipher>> resolveCiphers(String targetKey, List<String> names) {

@@ -1,18 +1,8 @@
 package com.enterprise.sfgexporter.scheduler;
 
-import com.enterprise.sfgexporter.backup.BackupRetentionService;
-import com.enterprise.sfgexporter.csv.StreamingCsvWriter;
-import com.enterprise.sfgexporter.db.OracleDataExtractor;
-import com.enterprise.sfgexporter.model.ExportJobConfig;
-import com.enterprise.sfgexporter.model.JobExecutionResult;
-import com.enterprise.sfgexporter.sftp.AtomicSftpUploader;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.slf4j.MDC;
-import org.springframework.stereotype.Service;
-
 import java.io.IOException;
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
@@ -20,6 +10,17 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+import org.springframework.stereotype.Service;
+
+import com.enterprise.sfgexporter.csv.StreamingCsvWriter;
+import com.enterprise.sfgexporter.db.OracleDataExtractor;
+import com.enterprise.sfgexporter.model.ExportJobConfig;
+import com.enterprise.sfgexporter.model.JobExecutionResult;
+import com.enterprise.sfgexporter.sftp.AtomicSftpUploader;
 
 /**
  * Coordinates the end-to-end execution of a single configured export pipeline:
@@ -115,9 +116,12 @@ public class ExportJobOrchestrator {
             String sanitizedError = sanitizeErrorMessage(ex);
             if (stagedFilePath != null) {
                 log.error("Export job '{}' failed after {} ms (staged file retained in staging dir as '{}'): {}",
-                        jobName, elapsed.toMillis(), stagedFilePath.getFileName(), sanitizedError, ex);
+                        jobName, elapsed.toMillis(), stagedFilePath.getFileName(), sanitizedError);
             } else {
-                log.error("Export job '{}' failed after {} ms: {}", jobName, elapsed.toMillis(), sanitizedError, ex);
+                log.error("Export job '{}' failed after {} ms: {}", jobName, elapsed.toMillis(), sanitizedError);
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("Failure stacktrace for job '{}'", jobName, ex);
             }
 
             JobExecutionResult failed = JobExecutionResult.failed(jobName, runId, startedAt, elapsed, sanitizedError);
@@ -131,12 +135,20 @@ public class ExportJobOrchestrator {
     }
 
     private String sanitizeErrorMessage(Throwable ex) {
-        String rawMessage = ex.getMessage();
-        String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\r\\n]+", " ");
-        if (cleaned.length() > 300) {
-            cleaned = cleaned.substring(0, 300) + "...";
+        Throwable root = ex;
+        int depth = 0;
+        while (root.getCause() != null && root.getCause() != root && depth++ < 32) {
+            root = root.getCause();
         }
-        return ex.getClass().getSimpleName() + ": " + cleaned;
+        if (root instanceof SQLException sqlEx) {
+            return "SQLException[vendorCode=" + sqlEx.getErrorCode() + ", sqlState=" + sqlEx.getSQLState() + "]";
+        }
+        String rawMessage = root.getMessage();
+        String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\r\\n\\t]+", " ");
+        if (cleaned.length() > 200) {
+            cleaned = cleaned.substring(0, 200) + "...";
+        }
+        return root.getClass().getSimpleName() + ": " + cleaned;
     }
 
     public Map<String, JobExecutionResult> getLastResults() {

@@ -6,7 +6,9 @@ import com.enterprise.sfgexporter.model.SourceType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
 
@@ -122,6 +124,79 @@ class SecurityValidatorTest {
         assertThatThrownBy(() -> SecurityValidator.ensureChildPath(tempDir, escaped))
                 .isInstanceOf(SecurityException.class)
                 .hasMessageContaining("Path traversal");
+    }
+
+    @Test
+    void ensureChildPathRejectsBaseDirectoryItself(@TempDir Path tempDir) {
+        assertThatThrownBy(() -> SecurityValidator.ensureChildPath(tempDir, tempDir))
+                .isInstanceOf(SecurityException.class)
+                .hasMessageContaining("Path traversal");
+    }
+
+    @Test
+    void rejectsDuplicateFilePrefixAcrossJobs() {
+        AppProperties props = buildValidProperties();
+        ExportJobConfig secondJob = buildValidProperties().getJobs().getFirst();
+        secondJob.setName("daily_gl_export_duplicate");
+        props.setJobs(List.of(props.getJobs().getFirst(), secondJob));
+
+        SecurityValidator validator = new SecurityValidator(props);
+        assertThatThrownBy(() -> validator.validateAll(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duplicate file-prefix");
+    }
+
+    @Test
+    void rejectsDisabledStrictHostKeyCheckingWithoutDevModeOptIn() {
+        AppProperties props = buildValidProperties();
+        props.getSftpTargets().get("sfg-primary").setStrictHostKeyChecking(false);
+
+        SecurityValidator validator = new SecurityValidator(props);
+        assertThatThrownBy(() -> validator.validateAll(props))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("allow-insecure-sftp-dev-mode");
+
+        props.setAllowInsecureSftpDevMode(true);
+        assertThatCode(() -> validator.validateAll(props)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void rejectsExternalSqlFileOutsideAllowedSqlDir(@TempDir Path tempDir) throws Exception {
+        Path allowedDir = Files.createDirectories(tempDir.resolve("allowed"));
+        Path outsideSql = Files.writeString(tempDir.resolve("outside.sql"), "SELECT 1 FROM DUAL");
+
+        AppProperties props = buildValidProperties();
+        props.getStorage().setSqlDir(allowedDir.toString());
+        ExportJobConfig job = props.getJobs().getFirst();
+        job.setSourceType(SourceType.SQL_QUERY);
+        job.setSqlFile("file:" + outsideSql.toAbsolutePath());
+
+        SecurityValidator validator = new SecurityValidator(props);
+        assertThatThrownBy(() -> validator.validateAll(props))
+                .isInstanceOf(SecurityException.class)
+                .hasMessageContaining("Path traversal");
+    }
+
+    @Test
+    void rejectsWorldWritableExternalSqlFile(@TempDir Path tempDir) throws Exception {
+        Path sqlDir = Files.createDirectories(tempDir.resolve("sql"));
+        Path sqlFile = Files.writeString(sqlDir.resolve("tamperable.sql"), "SELECT 1 FROM DUAL");
+        try {
+            Files.setPosixFilePermissions(sqlFile, PosixFilePermissions.fromString("rw-rw-rw-"));
+        } catch (UnsupportedOperationException ex) {
+            return; // Non-POSIX filesystem
+        }
+
+        AppProperties props = buildValidProperties();
+        props.getStorage().setSqlDir(sqlDir.toString());
+        ExportJobConfig job = props.getJobs().getFirst();
+        job.setSourceType(SourceType.SQL_QUERY);
+        job.setSqlFile("file:" + sqlFile.toAbsolutePath());
+
+        SecurityValidator validator = new SecurityValidator(props);
+        assertThatThrownBy(() -> validator.validateAll(props))
+                .isInstanceOf(SecurityException.class)
+                .hasMessageContaining("world-writable");
     }
 
     private AppProperties buildValidProperties() {

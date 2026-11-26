@@ -18,9 +18,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Uploads CSV files to IBM Sterling File Gateway (SFG) atomically with resilient retry handling:
@@ -49,6 +53,7 @@ public class AtomicSftpUploader {
     );
 
     private final SftpSessionFactoryRegistry sessionFactoryRegistry;
+    private final Map<String, Semaphore> targetBulkheads = new ConcurrentHashMap<>();
 
     public AtomicSftpUploader(SftpSessionFactoryRegistry sessionFactoryRegistry) {
         this.sessionFactoryRegistry = sessionFactoryRegistry;
@@ -70,6 +75,26 @@ public class AtomicSftpUploader {
         String finalRemotePath = buildRemotePath(targetConfig.getRemoteBaseDir(), jobRemoteDir, fileName);
         String tempRemotePath = finalRemotePath + targetConfig.getTempSuffix();
 
+        Semaphore bulkhead = targetBulkheads.computeIfAbsent(
+                targetKey, ignored -> new Semaphore(Math.max(1, targetConfig.getMaxConcurrentUploads())));
+        acquireBulkhead(bulkhead, targetKey, targetConfig.getConnectTimeoutMs());
+        try {
+            return executeWithRetry(
+                    sessionFactory, localFile, targetKey, targetConfig, fileName, tempRemotePath, finalRemotePath);
+        } finally {
+            bulkhead.release();
+        }
+    }
+
+    private String executeWithRetry(
+            SessionFactory<SftpClient.DirEntry> sessionFactory,
+            Path localFile,
+            String targetKey,
+            SftpTargetConfig targetConfig,
+            String fileName,
+            String tempRemotePath,
+            String finalRemotePath
+    ) {
         RetryConfig retry = targetConfig.getRetry();
         int maxAttempts = Math.max(1, retry.getMaxAttempts());
         long currentBackoffMs = retry.getInitialBackoffMs();
@@ -104,6 +129,17 @@ public class AtomicSftpUploader {
                 lastException);
     }
 
+    private void acquireBulkhead(Semaphore bulkhead, String targetKey, long timeoutMs) {
+        try {
+            if (!bulkhead.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)) {
+                throw new SftpUploadException("SFTP target '" + targetKey + "' concurrency bulkhead saturated", null);
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new SftpUploadException("Interrupted waiting for SFTP target '" + targetKey + "' slot", ex);
+        }
+    }
+
     private void executeAtomicTransfer(
             SessionFactory<SftpClient.DirEntry> sessionFactory,
             Path localFile,
@@ -126,6 +162,10 @@ public class AtomicSftpUploader {
     }
 
     private void cleanupRemoteTempFile(Session<SftpClient.DirEntry> session, String tempRemotePath) {
+        if (!session.isOpen()) {
+            log.debug("Skipping remote temp cleanup for '{}': SFTP session is already closed", tempRemotePath);
+            return;
+        }
         try {
             if (session.exists(tempRemotePath)) {
                 session.remove(tempRemotePath);

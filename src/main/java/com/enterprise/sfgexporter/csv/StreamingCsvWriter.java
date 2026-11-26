@@ -13,12 +13,15 @@ import org.springframework.stereotype.Component;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.math.BigDecimal;
+import java.nio.charset.Charset;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.Clob;
@@ -31,6 +34,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * Streams JDBC {@link ResultSet} rows directly to disk using Apache Commons CSV
@@ -77,16 +81,17 @@ public class StreamingCsvWriter {
 
         String finalFileName = buildTimestampedFileName(job);
         Path finalPath = SecurityValidator.ensureChildPath(stagingDir, stagingDir.resolve(finalFileName));
-        Path partPath = SecurityValidator.ensureChildPath(stagingDir, stagingDir.resolve(finalFileName + LOCAL_PART_SUFFIX));
+        String uniquePartName = finalFileName + "." + UUID.randomUUID().toString().substring(0, 8) + LOCAL_PART_SUFFIX;
+        Path partPath = SecurityValidator.ensureChildPath(stagingDir, stagingDir.resolve(uniquePartName));
 
         CsvOptions csvOptions = job.getCsv();
+        Charset charset = csvOptions.resolveCharset();
         CSVFormat format = buildCsvFormat(csvOptions);
 
         long rowCount = 0L;
         try {
-            try (BufferedWriter writer = new BufferedWriter(
-                    new OutputStreamWriter(Files.newOutputStream(partPath), csvOptions.resolveCharset()),
-                    WRITE_BUFFER_BYTES);
+            try (OutputStream out = openRestrictedOutputStream(partPath);
+                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(out, charset), WRITE_BUFFER_BYTES);
                  CSVPrinter printer = new CSVPrinter(writer, format)) {
 
                 ResultSetMetaData metaData = resultSet.getMetaData();
@@ -104,7 +109,7 @@ public class StreamingCsvWriter {
                 Object[] rowBuffer = new Object[columnCount];
                 while (resultSet.next()) {
                     for (int i = 1; i <= columnCount; i++) {
-                        rowBuffer[i - 1] = normalizeColumnValue(resultSet.getObject(i));
+                        rowBuffer[i - 1] = normalizeColumnValue(resultSet.getObject(i), csvOptions);
                     }
                     printer.printRecord(rowBuffer);
                     rowCount++;
@@ -119,7 +124,6 @@ public class StreamingCsvWriter {
             }
 
             promotePartFile(partPath, finalPath);
-            applyPosixPermissionsQuietly(finalPath, RESTRICTED_FILE_PERMS);
             log.info("Generated staged CSV '{}' with {} row(s) for job '{}'", finalFileName, rowCount, job.getName());
             return new StagedCsvFile(finalPath, finalFileName, rowCount);
 
@@ -150,29 +154,57 @@ public class StreamingCsvWriter {
         return builder.get();
     }
 
-    private Object normalizeColumnValue(Object value) throws SQLException {
+    private Object normalizeColumnValue(Object value, CsvOptions csvOptions) throws SQLException {
         if (value == null) {
             return null;
         }
         if (value instanceof BigDecimal decimal) {
-            // Avoid scientific notation for financial amounts and numeric identifiers
+            // Avoid scientific notation for financial amounts and numeric identifiers; negative numbers stay numeric
             return decimal.toPlainString();
         }
         if (value instanceof Clob clob) {
-            try {
-                long length = clob.length();
-                if (length == 0L) {
-                    return "";
-                }
-                if (length > Integer.MAX_VALUE) {
-                    throw new SQLException("CLOB column exceeds maximum supported string length");
-                }
-                return clob.getSubString(1L, (int) length);
-            } finally {
-                freeClobQuietly(clob);
-            }
+            String text = readClobBounded(clob, csvOptions.getMaxClobChars());
+            return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
+        }
+        if (value instanceof String text) {
+            return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
         }
         return value;
+    }
+
+    private String readClobBounded(Clob clob, int maxClobChars) throws SQLException {
+        try {
+            long length = clob.length();
+            if (length == 0L) {
+                return "";
+            }
+            if (length > maxClobChars) {
+                throw new SQLException("CLOB length (" + length + ") exceeds configured limit (" + maxClobChars + ")");
+            }
+            return clob.getSubString(1L, (int) length);
+        } finally {
+            freeClobQuietly(clob);
+        }
+    }
+
+    private String neutralizeFormulaIfNeeded(String text, boolean neutralizeFormulas) {
+        if (neutralizeFormulas && !text.isEmpty() && isFormulaTrigger(text.charAt(0))) {
+            return "'" + text;
+        }
+        return text;
+    }
+
+    private boolean isFormulaTrigger(char c) {
+        return c == '=' || c == '+' || c == '-' || c == '@' || c == '\t' || c == '\r';
+    }
+
+    private OutputStream openRestrictedOutputStream(Path partPath) throws IOException {
+        try {
+            Files.createFile(partPath, PosixFilePermissions.asFileAttribute(RESTRICTED_FILE_PERMS));
+        } catch (UnsupportedOperationException ignored) {
+            Files.createFile(partPath);
+        }
+        return Files.newOutputStream(partPath, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
     private void freeClobQuietly(Clob clob) {
@@ -189,15 +221,11 @@ public class StreamingCsvWriter {
         boolean existed = Files.exists(stagingDir);
         Files.createDirectories(stagingDir);
         if (!existed) {
-            applyPosixPermissionsQuietly(stagingDir, RESTRICTED_DIR_PERMS);
-        }
-    }
-
-    private void applyPosixPermissionsQuietly(Path path, Set<PosixFilePermission> permissions) {
-        try {
-            Files.setPosixFilePermissions(path, permissions);
-        } catch (UnsupportedOperationException | IOException ignored) {
-            // Non-POSIX filesystem or restricted chmod environment
+            try {
+                Files.setPosixFilePermissions(stagingDir, RESTRICTED_DIR_PERMS);
+            } catch (UnsupportedOperationException ignored) {
+                // Non-POSIX filesystem
+            }
         }
     }
 

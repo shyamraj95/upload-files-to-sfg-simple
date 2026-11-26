@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.util.Base64;
@@ -33,6 +34,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -60,13 +62,18 @@ class AtomicSftpUploaderIntegrationTest {
         serverHostKeyPair = keyGen.generateKeyPair();
         clientAuthKeyPair = keyGen.generateKeyPair();
 
-        // Write client RSA private key in PKCS#8 PEM format for SSH key authentication test
+        // Write client RSA private key in PKCS#8 PEM format with strict 0600 permissions
         clientPrivateKeyFile = tempDir.resolve("client_id_rsa.pem");
         String pem = "-----BEGIN PRIVATE KEY-----\n"
                 + Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.UTF_8))
                 .encodeToString(clientAuthKeyPair.getPrivate().getEncoded())
                 + "\n-----END PRIVATE KEY-----\n";
         Files.writeString(clientPrivateKeyFile, pem, StandardCharsets.UTF_8);
+        try {
+            Files.setPosixFilePermissions(clientPrivateKeyFile, PosixFilePermissions.fromString("rw-------"));
+        } catch (UnsupportedOperationException ignored) {
+            // Non-POSIX filesystem
+        }
 
         sshServer = SshServer.setUpDefaultServer();
         sshServer.setHost("127.0.0.1");
@@ -221,6 +228,7 @@ class AtomicSftpUploaderIntegrationTest {
         when(mockRegistry.getTargetConfig("sfg-partial")).thenReturn(target);
         when(mockRegistry.getSessionFactory("sfg-partial")).thenReturn(mockFactory);
         when(mockFactory.getSession()).thenReturn(failingSession);
+        when(failingSession.isOpen()).thenReturn(true);
         doThrow(new IOException("Mid-stream socket drop"))
                 .when(failingSession).write(any(), eq(expectedTempPath));
         when(failingSession.exists(expectedTempPath)).thenReturn(true);
@@ -230,6 +238,61 @@ class AtomicSftpUploaderIntegrationTest {
                 .isInstanceOf(AtomicSftpUploader.SftpUploadException.class);
 
         verify(failingSession).remove(expectedTempPath);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void skipsRemoteTempCleanupWhenSessionIsAlreadyClosed() throws Exception {
+        Path localCsv = tempDir.resolve("DEAD_SESSION_20261122_060000.csv");
+        Files.writeString(localCsv, "COL1\nVAL1\n", StandardCharsets.UTF_8);
+
+        SftpTargetConfig target = createTargetConfig(knownHostsFile.toString());
+        target.getRetry().setMaxAttempts(1);
+
+        SftpSessionFactoryRegistry mockRegistry = mock(SftpSessionFactoryRegistry.class);
+        SessionFactory<SftpClient.DirEntry> mockFactory = mock(SessionFactory.class);
+        Session<SftpClient.DirEntry> deadSession = mock(Session.class);
+
+        String expectedTempPath = "/inbound/finance/DEAD_SESSION_20261122_060000.csv.tmp";
+        when(mockRegistry.getTargetConfig("sfg-dead")).thenReturn(target);
+        when(mockRegistry.getSessionFactory("sfg-dead")).thenReturn(mockFactory);
+        when(mockFactory.getSession()).thenReturn(deadSession);
+        when(deadSession.isOpen()).thenReturn(false);
+        doThrow(new IOException("Transport closed")).when(deadSession).write(any(), eq(expectedTempPath));
+
+        AtomicSftpUploader uploader = new AtomicSftpUploader(mockRegistry);
+        assertThatThrownBy(() -> uploader.uploadAtomically(localCsv, "sfg-dead", "/finance"))
+                .isInstanceOf(AtomicSftpUploader.SftpUploadException.class);
+
+        verify(deadSession, never()).exists(any());
+        verify(deadSession, never()).remove(any());
+    }
+
+    @Test
+    void rejectsOverlyPermissiveSshPrivateKey() throws Exception {
+        try {
+            Files.setPosixFilePermissions(clientPrivateKeyFile, PosixFilePermissions.fromString("rw-r--r--"));
+        } catch (UnsupportedOperationException ex) {
+            return; // Non-POSIX filesystem
+        }
+
+        Path localCsv = tempDir.resolve("BAD_KEY_PERMS_20261122_060000.csv");
+        Files.writeString(localCsv, "A\n1\n", StandardCharsets.UTF_8);
+
+        SftpTargetConfig target = createTargetConfig(knownHostsFile.toString());
+        target.setUsername("sfgkeyuser");
+        target.setPassword(null);
+        target.setPrivateKeyPath(clientPrivateKeyFile.toString());
+
+        AppProperties props = new AppProperties();
+        props.setSftpTargets(Map.of("sfg-bad-key", target));
+
+        registry = new SftpSessionFactoryRegistry(props, new SshClientFactory());
+        AtomicSftpUploader uploader = new AtomicSftpUploader(registry);
+
+        assertThatThrownBy(() -> uploader.uploadAtomically(localCsv, "sfg-bad-key", "/finance"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("too open");
     }
 
     private SftpTargetConfig createTargetConfig(String knownHostsPath) {

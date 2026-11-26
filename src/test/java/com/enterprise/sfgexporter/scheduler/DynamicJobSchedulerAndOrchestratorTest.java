@@ -1,6 +1,5 @@
 package com.enterprise.sfgexporter.scheduler;
 
-import com.enterprise.sfgexporter.backup.BackupRetentionService;
 import com.enterprise.sfgexporter.config.AppProperties;
 import com.enterprise.sfgexporter.csv.StreamingCsvWriter;
 import com.enterprise.sfgexporter.db.OracleDataExtractor;

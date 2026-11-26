@@ -92,6 +92,9 @@ public class SftpTargetConfig {
     /** Exponential backoff retry settings for transient network/I/O SFTP failures. */
     private RetryConfig retry = new RetryConfig();
 
+    /** Maximum concurrent uploads allowed against this SFG target to prevent scheduler starvation. */
+    private int maxConcurrentUploads = 2;
+
     public String getHost() {
         return host;
     }
@@ -228,12 +231,28 @@ public class SftpTargetConfig {
         this.retry = retry;
     }
 
+    public int getMaxConcurrentUploads() {
+        return maxConcurrentUploads;
+    }
+
+    public void setMaxConcurrentUploads(int maxConcurrentUploads) {
+        this.maxConcurrentUploads = maxConcurrentUploads;
+    }
+
     public boolean hasPrivateKeyAuth() {
         return privateKeyPath != null && !privateKeyPath.isBlank();
     }
 
     public boolean hasPasswordAuth() {
         return password != null && !password.isBlank();
+    }
+
+    /**
+     * Releases plaintext secret references once the underlying {@code SshClient} has absorbed them.
+     */
+    public void clearSecrets() {
+        this.password = null;
+        this.privateKeyPassphrase = null;
     }
 
     /**

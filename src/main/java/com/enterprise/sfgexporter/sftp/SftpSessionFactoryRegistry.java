@@ -68,10 +68,19 @@ public class SftpSessionFactoryRegistry implements DisposableBean {
     @Override
     public void destroy() {
         for (ManagedTarget target : targets.values()) {
+            destroyFactoryQuietly(target.factory());
             stopClientQuietly(target.client());
         }
         targets.clear();
         log.info("Stopped all managed SFTP SshClient instances");
+    }
+
+    private void destroyFactoryQuietly(DefaultSftpSessionFactory factory) {
+        try {
+            factory.destroy();
+        } catch (RuntimeException ex) {
+            log.warn("Error destroying SftpSessionFactory cleanly: {}", ex.getMessage());
+        }
     }
 
     private void stopClientQuietly(SshClient client) {
@@ -84,6 +93,6 @@ public class SftpSessionFactoryRegistry implements DisposableBean {
         }
     }
 
-    private record ManagedTarget(SshClient client, SessionFactory<SftpClient.DirEntry> factory) {
+    private record ManagedTarget(SshClient client, DefaultSftpSessionFactory factory) {
     }
 }

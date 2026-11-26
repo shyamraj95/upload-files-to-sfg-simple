@@ -27,6 +27,11 @@ spring:
       connection-timeout: 20000
       idle-timeout: 300000
       max-lifetime: 1800000
+      # Bound Oracle TCP connect and SYS_REFCURSOR streaming socket reads so half-open sockets cannot hang jobs
+      data-source-properties:
+        "[oracle.net.CONNECT_TIMEOUT]": 15000
+        "[oracle.jdbc.ReadTimeout]": 300000
+        "[oracle.net.keepAlive]": true
 
 # Minimal operational health endpoint (Spring Boot 4 access model; no web controllers)
 management:
@@ -56,7 +61,10 @@ app:
   storage:
     staging-dir: ${APP_STAGING_DIR:/var/app/sfg-exporter/staging}
     backup-dir: ${APP_BACKUP_DIR:/var/app/sfg-exporter/backup}
+    # Optional base directory confining external file: SQL resources (recommended when using file: queries)
+    sql-dir: ${APP_SQL_DIR:}
     retention-days: ${APP_BACKUP_RETENTION_DAYS:15}
+    staging-part-max-age-hours: 24
     # Daily cleanup at 02:00 UTC deletes backup files and empty date folders older than retention-days
     cleanup-cron: "0 0 2 * * *"
     cleanup-time-zone: "UTC"
@@ -115,6 +123,7 @@ app:
         initial-backoff-ms: 2000
         multiplier: 2.0
         max-backoff-ms: 30000
+      max-concurrent-uploads: 2
 
     # Secondary SFG target example using Password authentication (if key auth is unavailable)
     "[sfg-partner-b]":
@@ -131,6 +140,7 @@ app:
         initial-backoff-ms: 3000
         multiplier: 2.0
         max-backoff-ms: 30000
+      max-concurrent-uploads: 2
 
   # ----------------------------------------------------------------------------
   # Configurable Export Jobs (List-Based Extensibility)

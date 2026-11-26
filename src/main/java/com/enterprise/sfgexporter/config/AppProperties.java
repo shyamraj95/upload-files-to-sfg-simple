@@ -31,6 +31,12 @@ public class AppProperties {
     /** Declarative list of independent Oracle-to-SFG export pipelines. */
     private List<ExportJobConfig> jobs = new ArrayList<>();
 
+    /**
+     * Explicit opt-in required before any SFTP target may set {@code strict-host-key-checking: false}.
+     * Must remain {@code false} in production to prevent accidental MITM exposure.
+     */
+    private boolean allowInsecureSftpDevMode = false;
+
     public StorageConfig getStorage() {
         return storage;
     }
@@ -63,6 +69,14 @@ public class AppProperties {
         this.jobs = jobs != null ? jobs : new ArrayList<>();
     }
 
+    public boolean isAllowInsecureSftpDevMode() {
+        return allowInsecureSftpDevMode;
+    }
+
+    public void setAllowInsecureSftpDevMode(boolean allowInsecureSftpDevMode) {
+        this.allowInsecureSftpDevMode = allowInsecureSftpDevMode;
+    }
+
     /**
      * Local filesystem directories and automated retention cleanup settings.
      */
@@ -73,8 +87,17 @@ public class AppProperties {
         /** Root archive directory containing {@code yyyy-MM-dd/} folders of uploaded CSVs. */
         private String backupDir = "./data/backup";
 
-        /** Number of days to retain local backup CSVs before automated deletion (default: 15). */
+        /**
+         * Optional allowlisted base directory confining external {@code file:} SQL resources.
+         * When set, all {@code file:} SQL paths must resolve strictly inside this directory.
+         */
+        private String sqlDir = "";
+
+        /** Number of days to retain local backup CSVs (and failed staged CSVs) before automated deletion (default: 15). */
         private int retentionDays = 15;
+
+        /** Age in hours after which crash-orphaned {@code .part} files in {@code staging/} are purged (default: 24). */
+        private int stagingPartMaxAgeHours = 24;
 
         /** Spring 6-field cron expression for the daily backup cleanup sweep. */
         private String cleanupCron = "0 0 2 * * *";
@@ -98,12 +121,28 @@ public class AppProperties {
             this.backupDir = backupDir;
         }
 
+        public String getSqlDir() {
+            return sqlDir;
+        }
+
+        public void setSqlDir(String sqlDir) {
+            this.sqlDir = sqlDir;
+        }
+
         public int getRetentionDays() {
             return retentionDays;
         }
 
         public void setRetentionDays(int retentionDays) {
             this.retentionDays = retentionDays;
+        }
+
+        public int getStagingPartMaxAgeHours() {
+            return stagingPartMaxAgeHours;
+        }
+
+        public void setStagingPartMaxAgeHours(int stagingPartMaxAgeHours) {
+            this.stagingPartMaxAgeHours = stagingPartMaxAgeHours;
         }
 
         public String getCleanupCron() {
