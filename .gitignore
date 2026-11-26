@@ -20,10 +20,10 @@ id_ed25519*
 known_hosts
 
 # Runtime working directories
-data/
-staging/
-backup/
-logs/
+/data/
+/staging/
+/backup/
+/logs/
 
 # IDE & OS files
 .idea/

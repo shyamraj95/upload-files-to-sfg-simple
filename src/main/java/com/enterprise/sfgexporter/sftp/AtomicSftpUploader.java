@@ -15,6 +15,7 @@ import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
@@ -63,8 +64,9 @@ public class AtomicSftpUploader {
      * Atomically uploads {@code localFile} to the configured SFG target and returns the final remote path.
      */
     public String uploadAtomically(Path localFile, String targetKey, String jobRemoteDir) {
-        if (!Files.isRegularFile(localFile)) {
-            throw new IllegalArgumentException("Local CSV file does not exist: " + localFile);
+        if (Files.isSymbolicLink(localFile) || !Files.isRegularFile(localFile, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException(
+                    "Local CSV file does not exist or is a symbolic link: " + localFile.getFileName());
         }
 
         SftpTargetConfig targetConfig = sessionFactoryRegistry.getTargetConfig(targetKey);
@@ -77,16 +79,12 @@ public class AtomicSftpUploader {
 
         Semaphore bulkhead = targetBulkheads.computeIfAbsent(
                 targetKey, ignored -> new Semaphore(Math.max(1, targetConfig.getMaxConcurrentUploads())));
-        acquireBulkhead(bulkhead, targetKey, targetConfig.getConnectTimeoutMs());
-        try {
-            return executeWithRetry(
-                    sessionFactory, localFile, targetKey, targetConfig, fileName, tempRemotePath, finalRemotePath);
-        } finally {
-            bulkhead.release();
-        }
+        return executeWithRetry(
+                bulkhead, sessionFactory, localFile, targetKey, targetConfig, fileName, tempRemotePath, finalRemotePath);
     }
 
     private String executeWithRetry(
+            Semaphore bulkhead,
             SessionFactory<SftpClient.DirEntry> sessionFactory,
             Path localFile,
             String targetKey,
@@ -100,9 +98,17 @@ public class AtomicSftpUploader {
         long currentBackoffMs = retry.getInitialBackoffMs();
 
         Exception lastException = null;
+        int attemptsExecuted = 0;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            attemptsExecuted = attempt;
+            acquireBulkhead(bulkhead, targetKey, targetConfig.getConnectTimeoutMs());
             try {
-                executeAtomicTransfer(sessionFactory, localFile, tempRemotePath, finalRemotePath);
+                try {
+                    executeAtomicTransfer(sessionFactory, localFile, tempRemotePath, finalRemotePath);
+                } finally {
+                    // Release concurrency permit immediately after transfer attempt, before retry backoff sleep
+                    bulkhead.release();
+                }
                 log.info("Atomically uploaded '{}' to SFG target '{}' at '{}' (attempt {}/{})",
                         fileName, targetKey, finalRemotePath, attempt, maxAttempts);
                 return finalRemotePath;
@@ -125,7 +131,7 @@ public class AtomicSftpUploader {
         }
 
         throw new SftpUploadException(
-                "Failed to upload '" + fileName + "' to SFTP target '" + targetKey + "' after " + maxAttempts + " attempt(s)",
+                "Failed to upload '" + fileName + "' to SFTP target '" + targetKey + "' after " + attemptsExecuted + " attempt(s)",
                 lastException);
     }
 
@@ -147,7 +153,8 @@ public class AtomicSftpUploader {
             String finalRemotePath
     ) throws IOException {
         try (Session<SftpClient.DirEntry> session = sessionFactory.getSession()) {
-            try (InputStream inputStream = new BufferedInputStream(Files.newInputStream(localFile), STREAM_BUFFER_BYTES)) {
+            try (InputStream inputStream = new BufferedInputStream(
+                    Files.newInputStream(localFile, LinkOption.NOFOLLOW_LINKS), STREAM_BUFFER_BYTES)) {
                 session.write(inputStream, tempRemotePath);
                 session.rename(tempRemotePath, finalRemotePath);
             } catch (IOException ex) {
@@ -172,14 +179,15 @@ public class AtomicSftpUploader {
                 log.debug("Cleaned up incomplete remote temp file '{}'", tempRemotePath);
             }
         } catch (IOException | RuntimeException cleanupEx) {
-            log.warn("Unable to remove incomplete remote temp file '{}': {}", tempRemotePath, cleanupEx.getMessage());
+            log.warn("Unable to remove incomplete remote temp file '{}': {}",
+                    tempRemotePath, summarizeException(cleanupEx));
         }
     }
 
     String buildRemotePath(String baseDir, String jobDir, String fileName) {
         SecurityValidator.validateRemotePath(baseDir, "remoteBaseDir");
         SecurityValidator.validateRemotePath(jobDir, "remoteDir");
-        SecurityValidator.validateRemotePath(fileName, "fileName");
+        SecurityValidator.validateSafeFileName(fileName, "fileName");
 
         StringBuilder path = new StringBuilder();
         appendPathSegment(path, baseDir);
@@ -223,16 +231,22 @@ public class AtomicSftpUploader {
      * rather than retrying and risking SFG account lockout.
      */
     boolean isNonRetryable(Throwable throwable) {
-        for (Throwable current = throwable; current != null; current = current.getCause()) {
+        int depth = 0;
+        for (Throwable current = throwable; current != null && depth++ < 32; current = current.getCause()) {
             if (isPermanentFailure(current)) {
                 return true;
+            }
+            if (current.getCause() == current) {
+                break;
             }
         }
         return false;
     }
 
     private boolean isPermanentFailure(Throwable cause) {
-        if (cause instanceof SecurityException || cause instanceof IllegalArgumentException) {
+        if (cause instanceof SecurityException
+                || cause instanceof IllegalArgumentException
+                || cause instanceof InterruptedException) {
             return true;
         }
         if (cause instanceof SshException sshEx
@@ -276,12 +290,18 @@ public class AtomicSftpUploader {
         }
     }
 
-    private String summarizeException(Throwable ex) {
+    String summarizeException(Throwable ex) {
         Throwable root = ex;
-        while (root.getCause() != null && root.getCause() != root) {
+        int depth = 0;
+        while (root.getCause() != null && root.getCause() != root && depth++ < 32) {
             root = root.getCause();
         }
-        return root.getClass().getSimpleName() + ": " + root.getMessage();
+        String rawMessage = root.getMessage();
+        String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\p{Cntrl}]+", " ");
+        if (cleaned.length() > 200) {
+            cleaned = cleaned.substring(0, 200) + "...";
+        }
+        return root.getClass().getSimpleName() + ": " + cleaned;
     }
 
     public static class SftpUploadException extends RuntimeException {

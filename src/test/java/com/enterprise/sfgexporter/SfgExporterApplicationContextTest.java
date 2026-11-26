@@ -77,7 +77,7 @@ class SfgExporterApplicationContextTest {
                 .containsKeys("P_LOOKBACK_DAYS", "P_LEDGER_CODE");
         assertThat(dataSource).isInstanceOf(HikariDataSource.class);
         HikariDataSource hikari = (HikariDataSource) dataSource;
-        assertThat(hikari.getDataSourceProperties().get("oracle.jdbc.ReadTimeout")).hasToString("300000");
+        assertThat(hikari.getDataSourceProperties().get("oracle.jdbc.ReadTimeout")).hasToString("660000");
         assertThat(hikari.getDataSourceProperties().get("oracle.net.CONNECT_TIMEOUT")).hasToString("15000");
         assertThat(healthIndicator.health().getStatus()).isEqualTo(Status.UP);
     }

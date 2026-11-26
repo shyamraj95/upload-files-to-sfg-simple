@@ -100,9 +100,8 @@ oracle-sfg-exporter/
     │   │   │   ├── SshClientFactory.java                   # Hardened Apache MINA SshClient builder
     │   │   │   ├── SftpSessionFactoryRegistry.java         # Per-target DefaultSftpSessionFactory lifecycle manager
     │   │   │   └── AtomicSftpUploader.java                 # Atomic .tmp -> .csv uploader with exponential backoff retry
-    │   │   ├── backup/
-    │   │   │   └── BackupRetentionService.java             # staging/ -> backup/yyyy-MM-dd/ archiver & 15-day cleanup
     │   │   └── scheduler/
+    │   │       ├── BackupRetentionService.java             # staging/ -> backup/yyyy-MM-dd/ archiver & 15-day cleanup
     │   │       ├── DynamicJobScheduler.java                # Registers enabled app.jobs[] cron triggers on TaskScheduler
     │   │       ├── ExportJobOrchestrator.java              # End-to-end execution, per-job locking, MDC correlation
     │   │       └── ExportJobsHealthIndicator.java          # Spring Boot 4 Actuator HealthIndicator ("exportJobs")
@@ -148,8 +147,10 @@ All application settings live under `app.*` in [application.yml](src/main/resour
 | Property | Default | Description |
 | --- | --- | --- |
 | `staging-dir` | `./data/staging` | Directory where CSVs are streamed before SFTP upload |
-| `backup-dir` | `./data/backup` | Archive root containing `yyyy-MM-dd/` folders |
+| `backup-dir` | `./data/backup` | Archive root containing `yyyy-MM-dd/` folders (must be distinct from `staging-dir`) |
+| `sql-dir` | `""` | Optional allowlisted directory confining external `file:` SQL scripts (must be a non-symlink directory) |
 | `retention-days` | `15` | Days to retain backup files/folders before deletion (`>= 1`) |
+| `staging-part-max-age-hours` | `24` | Age in hours after which crash-orphaned `.part` staging files are purged (`>= 1`) |
 | `cleanup-cron` | `0 0 2 * * *` | Spring 6-field cron expression for daily retention sweep |
 | `cleanup-time-zone` | `UTC` | IANA time zone for cleanup schedule & archive date folders |
 
@@ -168,12 +169,13 @@ All application settings live under `app.*` in [application.yml](src/main/resour
 | `private-key-passphrase` | — | Optional passphrase for encrypted private key |
 | `password` | — | Password auth fallback when `private-key-path` is unset |
 | `known-hosts-path` | — | Required when `strict-host-key-checking: true` |
-| `strict-host-key-checking` | `true` | Rejects unknown or rotated server host keys by default |
+| `strict-host-key-checking` | `true` | Rejects unknown or rotated server host keys by default (`false` requires `app.allow-insecure-sftp-dev-mode: true`) |
 | `temp-suffix` | `.tmp` | Suffix used during upload before atomic rename to `.csv` |
 | `remote-base-dir` | `""` | Base mailbox path prepended to every job's `remote-dir` |
 | `connect/auth/channel-open-timeout-ms` | `15000` | Deterministic SSH/SFTP timeouts (`>= 1000` ms) |
-| `allowed-ciphers` / `allowed-key-exchanges` / `allowed-macs` | Modern defaults | Strict allowlists of strong cryptographic algorithms |
-| `retry.max-attempts` / `initial-backoff-ms` / `multiplier` / `max-backoff-ms` | `3` / `2000` / `2.0` / `30000` | Jittered exponential backoff settings for transient SFTP failures |
+| `max-concurrent-uploads` | `2` | Per-target upload concurrency bulkhead (`>= 1`) |
+| `allowed-ciphers` / `allowed-key-exchanges` / `allowed-macs` | Modern defaults | Strict allowlists validated against approved strong cryptographic algorithms |
+| `retry.max-attempts` / `initial-backoff-ms` / `multiplier` / `max-backoff-ms` | `3` / `2000` / `2.0` / `30000` | Jittered exponential backoff settings for transient SFTP failures (`max-attempts <= 20`, `max-backoff-ms <= 300000`) |
 
 ### `app.jobs[]`
 | Property | Default | Description |
@@ -187,7 +189,7 @@ All application settings live under `app.*` in [application.yml](src/main/resour
 | `parameters` | `{}` | Map of IN parameters (`param => ?` for PL/SQL or `:param` for SQL) |
 | `fetch-size` / `query-timeout-seconds` | `1000` / `300` | Oracle JDBC cursor chunk size and statement timeout |
 | `file-prefix` / `timestamp-pattern` | *(required)* / `yyyyMMdd_HHmmss` | Produces `<file-prefix>_<timestamp>.csv` |
-| `csv.*` | `,`, header `true`, `"`, `\n`, `UTF-8`, empty `true` | Delimiter, header, quote char, record separator, null string, charset, `write-empty-file` |
+| `csv.*` | `,`, header `true`, `"`, `\n`, `UTF-8`, empty `true`, `neutralize-formulas: true`, `max-clob-chars: 1048576` | Delimiter, header, quote char, record separator, null string, charset, `write-empty-file`, CSV formula injection neutralization, max LOB char limit |
 | `sftp-target` / `remote-dir` | *(required)* / `""` | Key in `app.sftp-targets` and target SFG mailbox subdirectory |
 
 ---
@@ -203,6 +205,7 @@ All credentials and sensitive paths must be provided via server environment vari
 | `ORACLE_DB_PASSWORD` | Yes | Oracle database password |
 | `APP_STAGING_DIR` | No | Local staging directory (default: `/var/app/sfg-exporter/staging`) |
 | `APP_BACKUP_DIR` | No | Local backup directory (default: `/var/app/sfg-exporter/backup`) |
+| `APP_SQL_DIR` | No | Optional base directory confining external `file:` SQL scripts (default: unset) |
 | `APP_BACKUP_RETENTION_DAYS` | No | Backup retention window in days (default: `15`) |
 | `SFG_PRIMARY_HOST` | Yes | Primary IBM SFG SFTP hostname or IP |
 | `SFG_PRIMARY_PORT` | No | Primary IBM SFG SFTP port (default: `22`) |
@@ -447,20 +450,20 @@ app:
 ## Building, Testing & Packaging
 
 ```bash
-# Clean compile (with -Xlint:all,-processing,-classfile) and run all 22 tests
+# Clean compile (with -Xlint:all,-processing,-classfile) and run all 54 tests
 mvn clean test
 
 # Build executable Spring Boot fat JAR (target/oracle-sfg-exporter-1.0.0.jar)
 mvn clean package
 ```
 
-### What the Test Suite Covers (22 Tests)
-- `SfgExporterApplicationContextTest` — Boots the full Spring Boot 4.1.3 context with H2 and verifies bean wiring, startup validation, scheduler registration, clean shutdown, and Actuator health (`UP`).
-- `SecurityValidatorTest` — Rejects SQL injection in procedure names, path traversal in file prefixes/remote dirs/SQL paths, missing `known_hosts`, missing auth, missing SQL files, and empty cipher lists.
-- `StreamingCsvWriterAndExtractorTest` — Streams real H2 JDBC `ResultSet` rows to timestamped CSV, verifies quoting/pipes/`BigDecimal`/nulls, `write-empty-file: false` skipping, and safe PL/SQL call generation.
-- `AtomicSftpUploaderIntegrationTest` — Spins up a real embedded Apache MINA SFTP server to verify SSH private-key auth, password auth, atomic `.tmp` → `.csv` rename, strict `known_hosts` rejection, exponential backoff retry, and partial `.tmp` cleanup on mid-stream failure.
-- `BackupRetentionServiceTest` — Verifies atomic archiving into `backup/yyyy-MM-dd/`, deletion of files/folders older than 15 days, retention of the exact 15-day boundary, and pruning of stale empty folders.
-- `DynamicJobSchedulerAndOrchestratorTest` — Verifies enabled-only dynamic cron registration and end-to-end orchestration.
+### What the Test Suite Covers (54 Tests)
+- `SfgExporterApplicationContextTest` — Boots the full Spring Boot 4.1.3 context with H2 and verifies bean wiring, HikariCP Oracle socket timeouts, startup validation, scheduler registration, clean shutdown, and Actuator health (`UP`).
+- `SecurityValidatorTest` — Rejects SQL injection in procedure names, path traversal/UNC paths/symlinks in file prefixes/remote dirs/`sql-dir`/SQL paths, overlapping staging & backup dirs, missing `known_hosts`, disabled strict host-key checking without dev opt-in, missing auth, missing SQL files, and weak/disallowed SSH algorithms.
+- `StreamingCsvWriterAndExtractorTest` — Streams real H2 JDBC `ResultSet` rows to timestamped CSV, verifies quoting/pipes/`BigDecimal`/nulls, CSV formula injection neutralization (cells, headers, leading whitespace/newlines), bounded `CLOB`/`SQLXML` & `BLOB` resource freeing, `write-empty-file: false` skipping, oversized SQL rejection, statement cleanup on bind errors, and safe PL/SQL call generation.
+- `AtomicSftpUploaderIntegrationTest` — Spins up a real embedded Apache MINA SFTP server to verify SSH private-key auth, password auth, strict `0600` key/`known_hosts` permission checks, atomic `.tmp` → `.csv` rename, strict `known_hosts` rejection, exponential backoff retry with bulkhead release during sleep, partial `.tmp` cleanup on mid-stream failure, and cyclic exception cause / control-char sanitization.
+- `BackupRetentionServiceTest` — Verifies atomic archiving into `backup/yyyy-MM-dd/`, symlink rejection (staging files, backup root, date folders, and expired folder entries), orphan `.part` staging cleanup, deletion of files/folders older than 15 days, retention of the exact 15-day boundary, and pruning of stale empty folders.
+- `DynamicJobSchedulerAndOrchestratorTest` — Verifies enabled-only dynamic cron registration, end-to-end orchestration, and safe failure reporting without duplicate SFTP re-upload if local archiving fails after upload.
 
 *(Note: `maven-surefire-plugin` passes `-Xshare:off -javaagent:...byte-buddy-agent...` solely during `mvn test` to prevent Java 21 JEP 451 dynamic agent warnings from Mockito; it has zero effect on the production JAR.)*
 

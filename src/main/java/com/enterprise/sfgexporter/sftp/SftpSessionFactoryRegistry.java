@@ -59,7 +59,7 @@ public class SftpSessionFactoryRegistry implements DisposableBean {
             factory.setUser(config.getUsername());
             factory.setTimeout((int) Math.min(config.getChannelOpenTimeoutMs(), Integer.MAX_VALUE));
             return new ManagedTarget(sshClient, factory);
-        } catch (RuntimeException ex) {
+        } catch (Throwable ex) {
             stopClientQuietly(sshClient);
             throw ex;
         }
@@ -85,9 +85,7 @@ public class SftpSessionFactoryRegistry implements DisposableBean {
 
     private void stopClientQuietly(SshClient client) {
         try {
-            if (client.isStarted()) {
-                client.stop();
-            }
+            client.close(true);
         } catch (RuntimeException ex) {
             log.warn("Error stopping SshClient cleanly: {}", ex.getMessage());
         }

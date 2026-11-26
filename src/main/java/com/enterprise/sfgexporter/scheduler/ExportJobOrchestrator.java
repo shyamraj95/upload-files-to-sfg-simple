@@ -73,6 +73,8 @@ public class ExportJobOrchestrator {
         MDC.put("jobName", jobName);
         MDC.put("runId", runId);
         Path stagedFilePath = null;
+        boolean uploaded = false;
+        String uploadedRemotePath = null;
         try {
             log.info("Starting export job '{}' [sourceType={}, sftpTarget={}]",
                     jobName, job.getSourceType(), job.getSftpTarget());
@@ -88,8 +90,9 @@ public class ExportJobOrchestrator {
             }
 
             // Step 3: Atomic SFTP upload (.tmp -> rename .csv) with exponential backoff retry
-            String remotePath = sftpUploader.uploadAtomically(
+            uploadedRemotePath = sftpUploader.uploadAtomically(
                     stagedFilePath, job.getSftpTarget(), job.getRemoteDir());
+            uploaded = true;
 
             // Step 4: Move uploaded CSV from staging/ to backup/yyyy-MM-dd/
             Path backupPath = backupRetentionService.archiveToBackup(stagedFilePath);
@@ -100,7 +103,7 @@ public class ExportJobOrchestrator {
                     runId,
                     stagedCsv.rowCount(),
                     stagedCsv.fileName(),
-                    remotePath,
+                    uploadedRemotePath,
                     backupPath.toString(),
                     startedAt,
                     elapsed
@@ -114,7 +117,12 @@ public class ExportJobOrchestrator {
         } catch (IOException | RuntimeException ex) {
             Duration elapsed = Duration.between(startedAt, Instant.now());
             String sanitizedError = sanitizeErrorMessage(ex);
-            if (stagedFilePath != null) {
+            if (uploaded && stagedFilePath != null) {
+                log.error("Export job '{}' uploaded '{}' to '{}' successfully but failed local backup archiving after {} ms "
+                                + "(DO NOT re-upload duplicate file to SFG; manually move staged file '{}' to backup): {}",
+                        jobName, stagedFilePath.getFileName(), uploadedRemotePath, elapsed.toMillis(),
+                        stagedFilePath.getFileName(), sanitizedError);
+            } else if (stagedFilePath != null) {
                 log.error("Export job '{}' failed after {} ms (staged file retained in staging dir as '{}'): {}",
                         jobName, elapsed.toMillis(), stagedFilePath.getFileName(), sanitizedError);
             } else {
@@ -144,7 +152,7 @@ public class ExportJobOrchestrator {
             return "SQLException[vendorCode=" + sqlEx.getErrorCode() + ", sqlState=" + sqlEx.getSQLState() + "]";
         }
         String rawMessage = root.getMessage();
-        String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\r\\n\\t]+", " ");
+        String cleaned = rawMessage == null ? "No error message" : rawMessage.replaceAll("[\\p{Cntrl}]+", " ");
         if (cleaned.length() > 200) {
             cleaned = cleaned.substring(0, 200) + "...";
         }

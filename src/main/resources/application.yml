@@ -28,9 +28,10 @@ spring:
       idle-timeout: 300000
       max-lifetime: 1800000
       # Bound Oracle TCP connect and SYS_REFCURSOR streaming socket reads so half-open sockets cannot hang jobs
+      # 660s provides 60s headroom above the longest job query-timeout-seconds (600s)
       data-source-properties:
         "[oracle.net.CONNECT_TIMEOUT]": 15000
-        "[oracle.jdbc.ReadTimeout]": 300000
+        "[oracle.jdbc.ReadTimeout]": 660000
         "[oracle.net.keepAlive]": true
 
 # Minimal operational health endpoint (Spring Boot 4 access model; no web controllers)

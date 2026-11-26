@@ -1,6 +1,7 @@
 package com.enterprise.sfgexporter.model;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * Configuration for a named IBM Sterling File Gateway (SFG) SFTP target server.
@@ -40,6 +41,10 @@ public class SftpTargetConfig {
             "hmac-sha2-512",
             "hmac-sha2-256"
     );
+
+    public static final Set<String> APPROVED_STRONG_CIPHERS = Set.copyOf(DEFAULT_STRONG_CIPHERS);
+    public static final Set<String> APPROVED_STRONG_KEX = Set.copyOf(DEFAULT_STRONG_KEX);
+    public static final Set<String> APPROVED_STRONG_MACS = Set.copyOf(DEFAULT_STRONG_MACS);
 
     /** Remote IBM SFG SFTP hostname or IP address. */
     private String host;

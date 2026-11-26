@@ -15,24 +15,32 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.io.Reader;
 import java.math.BigDecimal;
+import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.Charset;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLXML;
 import java.time.Clock;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.Temporal;
+import java.util.Date;
 import java.util.Set;
 import java.util.UUID;
 
@@ -89,6 +97,7 @@ public class StreamingCsvWriter {
         CSVFormat format = buildCsvFormat(csvOptions);
 
         long rowCount = 0L;
+        boolean finalized = false;
         try {
             try (OutputStream out = openRestrictedOutputStream(partPath);
                  BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(out, charset), WRITE_BUFFER_BYTES);
@@ -100,7 +109,8 @@ public class StreamingCsvWriter {
                 if (csvOptions.isIncludeHeader() && columnCount > 0) {
                     String[] headers = new String[columnCount];
                     for (int i = 1; i <= columnCount; i++) {
-                        headers[i - 1] = metaData.getColumnLabel(i);
+                        headers[i - 1] = neutralizeFormulaIfNeeded(
+                                metaData.getColumnLabel(i), csvOptions.isNeutralizeFormulas());
                     }
                     printer.printRecord((Object[]) headers);
                 }
@@ -119,17 +129,20 @@ public class StreamingCsvWriter {
 
             if (rowCount == 0 && !csvOptions.isWriteEmptyFile()) {
                 Files.deleteIfExists(partPath);
+                finalized = true;
                 log.info("Job '{}' produced 0 rows and write-empty-file=false; skipping CSV creation", job.getName());
                 return new StagedCsvFile(null, null, 0L);
             }
 
             promotePartFile(partPath, finalPath);
+            finalized = true;
             log.info("Generated staged CSV '{}' with {} row(s) for job '{}'", finalFileName, rowCount, job.getName());
             return new StagedCsvFile(finalPath, finalFileName, rowCount);
 
-        } catch (IOException | SQLException | RuntimeException ex) {
-            deleteQuietly(partPath);
-            throw ex;
+        } finally {
+            if (!finalized) {
+                deleteQuietly(partPath);
+            }
         }
     }
 
@@ -162,14 +175,25 @@ public class StreamingCsvWriter {
             // Avoid scientific notation for financial amounts and numeric identifiers; negative numbers stay numeric
             return decimal.toPlainString();
         }
+        if (value instanceof Number || value instanceof Boolean || value instanceof Temporal || value instanceof Date) {
+            return value;
+        }
         if (value instanceof Clob clob) {
             String text = readClobBounded(clob, csvOptions.getMaxClobChars());
             return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
         }
+        if (value instanceof SQLXML sqlxml) {
+            String text = readSqlXmlBounded(sqlxml, csvOptions.getMaxClobChars());
+            return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
+        }
+        if (value instanceof Blob blob) {
+            freeBlobQuietly(blob);
+            throw new SQLException("Unsupported BLOB column in CSV export");
+        }
         if (value instanceof String text) {
             return neutralizeFormulaIfNeeded(text, csvOptions.isNeutralizeFormulas());
         }
-        return value;
+        return neutralizeFormulaIfNeeded(value.toString(), csvOptions.isNeutralizeFormulas());
     }
 
     private String readClobBounded(Clob clob, int maxClobChars) throws SQLException {
@@ -187,24 +211,60 @@ public class StreamingCsvWriter {
         }
     }
 
+    private String readSqlXmlBounded(SQLXML sqlxml, int maxChars) throws SQLException {
+        try (Reader reader = sqlxml.getCharacterStream()) {
+            if (reader == null) {
+                return "";
+            }
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[Math.min(4096, Math.max(1, maxChars))];
+            int read;
+            while ((read = reader.read(buf)) != -1) {
+                if (sb.length() + read > maxChars) {
+                    throw new SQLException("SQLXML length exceeds configured limit (" + maxChars + ")");
+                }
+                sb.append(buf, 0, read);
+            }
+            return sb.toString();
+        } catch (IOException ex) {
+            throw new SQLException("Failed to read SQLXML column: " + ex.getMessage(), ex);
+        } finally {
+            freeSqlXmlQuietly(sqlxml);
+        }
+    }
+
     private String neutralizeFormulaIfNeeded(String text, boolean neutralizeFormulas) {
-        if (neutralizeFormulas && !text.isEmpty() && isFormulaTrigger(text.charAt(0))) {
+        if (!neutralizeFormulas || text == null || text.isEmpty()) {
+            return text;
+        }
+        if (isFormulaTrigger(text.charAt(0))) {
             return "'" + text;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (!Character.isWhitespace(c)) {
+                if (c == '=' || c == '+' || c == '-' || c == '@') {
+                    return "'" + text;
+                }
+                break;
+            }
         }
         return text;
     }
 
     private boolean isFormulaTrigger(char c) {
-        return c == '=' || c == '+' || c == '-' || c == '@' || c == '\t' || c == '\r';
+        return c == '=' || c == '+' || c == '-' || c == '@' || c == '\t' || c == '\r' || c == '\n';
     }
 
     private OutputStream openRestrictedOutputStream(Path partPath) throws IOException {
+        Set<StandardOpenOption> options = Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        SeekableByteChannel channel;
         try {
-            Files.createFile(partPath, PosixFilePermissions.asFileAttribute(RESTRICTED_FILE_PERMS));
+            channel = Files.newByteChannel(partPath, options, PosixFilePermissions.asFileAttribute(RESTRICTED_FILE_PERMS));
         } catch (UnsupportedOperationException ignored) {
-            Files.createFile(partPath);
+            channel = Files.newByteChannel(partPath, options);
         }
-        return Files.newOutputStream(partPath, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+        return Channels.newOutputStream(channel);
     }
 
     private void freeClobQuietly(Clob clob) {
@@ -217,8 +277,32 @@ public class StreamingCsvWriter {
         }
     }
 
+    private void freeSqlXmlQuietly(SQLXML sqlxml) {
+        try {
+            sqlxml.free();
+        } catch (SQLFeatureNotSupportedException ignored) {
+            // Driver does not support explicit SQLXML freeing
+        } catch (SQLException ex) {
+            log.debug("Failed to free JDBC SQLXML cleanly: {}", ex.getMessage());
+        }
+    }
+
+    private void freeBlobQuietly(Blob blob) {
+        try {
+            blob.free();
+        } catch (SQLFeatureNotSupportedException ignored) {
+            // Driver does not support explicit BLOB freeing
+        } catch (SQLException ex) {
+            log.debug("Failed to free JDBC BLOB cleanly: {}", ex.getMessage());
+        }
+    }
+
     private void ensureStagingDirectory() throws IOException {
-        boolean existed = Files.exists(stagingDir);
+        if (Files.isSymbolicLink(stagingDir)) {
+            throw new SecurityException(
+                    "Refusing to use symbolic link as staging directory: " + stagingDir.getFileName());
+        }
+        boolean existed = Files.exists(stagingDir, LinkOption.NOFOLLOW_LINKS);
         Files.createDirectories(stagingDir);
         if (!existed) {
             try {
@@ -230,6 +314,10 @@ public class StreamingCsvWriter {
     }
 
     private void promotePartFile(Path partPath, Path finalPath) throws IOException {
+        if (Files.isSymbolicLink(finalPath)) {
+            throw new SecurityException(
+                    "Refusing to overwrite symbolic link in staging directory: " + finalPath.getFileName());
+        }
         try {
             Files.move(partPath, finalPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException ex) {

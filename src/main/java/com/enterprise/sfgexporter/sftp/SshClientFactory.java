@@ -24,6 +24,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
@@ -65,11 +66,14 @@ public class SshClientFactory {
             // 2. Enforce strict host key verification via server-mounted known_hosts
             if (config.isStrictHostKeyChecking()) {
                 Path knownHostsPath = Path.of(config.getKnownHostsPath()).toAbsolutePath().normalize();
-                if (!Files.isRegularFile(knownHostsPath) || !Files.isReadable(knownHostsPath)) {
+                if (Files.isSymbolicLink(knownHostsPath)
+                        || !Files.isRegularFile(knownHostsPath, LinkOption.NOFOLLOW_LINKS)
+                        || !Files.isReadable(knownHostsPath)) {
                     throw new IllegalStateException(
                             "Cannot initialize SFTP target '" + targetKey
-                                    + "': known_hosts file does not exist or is not readable at " + knownHostsPath);
+                                    + "': known_hosts file must be a readable non-symlink regular file at " + knownHostsPath);
                 }
+                rejectWorldWritableFile(knownHostsPath, targetKey);
                 // RejectAllServerKeyVerifier delegate guarantees unknown hosts are rejected
                 client.setServerKeyVerifier(
                         new KnownHostsServerKeyVerifier(RejectAllServerKeyVerifier.INSTANCE, knownHostsPath));
@@ -81,11 +85,13 @@ public class SshClientFactory {
             // 3. Configure authentication strictly on the external SshClient (SSH private key preferred)
             configureAuthentication(client, targetKey, config);
 
-            // 4. Configure deterministic network and authentication timeouts
+            // 4. Configure deterministic network, read, keepalive, and authentication timeouts
+            Duration ioTimeout = Duration.ofMillis(Math.max(config.getChannelOpenTimeoutMs() * 2L, 30_000L));
             CoreModuleProperties.IO_CONNECT_TIMEOUT.set(client, Duration.ofMillis(config.getConnectTimeoutMs()));
             CoreModuleProperties.AUTH_TIMEOUT.set(client, Duration.ofMillis(config.getAuthTimeoutMs()));
-            CoreModuleProperties.IDLE_TIMEOUT.set(
-                    client, Duration.ofMillis(Math.max(config.getChannelOpenTimeoutMs() * 2L, 30_000L)));
+            CoreModuleProperties.IDLE_TIMEOUT.set(client, ioTimeout);
+            CoreModuleProperties.NIO2_READ_TIMEOUT.set(client, ioTimeout);
+            CoreModuleProperties.SOCKET_KEEPALIVE.set(client, true);
 
             client.start();
             // Release plaintext credential references from the config object once absorbed by SshClient
@@ -93,20 +99,29 @@ public class SshClientFactory {
             log.info("Started hardened SshClient for target '{}' (host={}:{}, strictHostKeyChecking={})",
                     targetKey, config.getHost(), config.getPort(), config.isStrictHostKeyChecking());
             return client;
-        } catch (RuntimeException ex) {
-            if (client.isStarted()) {
-                client.stop();
-            }
+        } catch (Throwable ex) {
+            closeClientQuietly(client);
             throw ex;
+        }
+    }
+
+    private void closeClientQuietly(SshClient client) {
+        try {
+            client.close(true);
+        } catch (RuntimeException cleanupEx) {
+            log.warn("Error closing SshClient after initialization failure: {}", cleanupEx.getMessage());
         }
     }
 
     private void configureAuthentication(SshClient client, String targetKey, SftpTargetConfig config) {
         if (config.hasPrivateKeyAuth()) {
             Path keyPath = Path.of(config.getPrivateKeyPath()).toAbsolutePath().normalize();
-            if (!Files.isRegularFile(keyPath) || !Files.isReadable(keyPath)) {
+            if (Files.isSymbolicLink(keyPath)
+                    || !Files.isRegularFile(keyPath, LinkOption.NOFOLLOW_LINKS)
+                    || !Files.isReadable(keyPath)) {
                 throw new IllegalStateException(
-                        "SSH private key for target '" + targetKey + "' does not exist or is not readable: " + keyPath);
+                        "SSH private key for target '" + targetKey
+                                + "' does not exist, is a symlink, or is not readable: " + keyPath);
             }
             enforcePrivateKeyPermissions(keyPath, targetKey);
             FileKeyPairProvider keyPairProvider = new FileKeyPairProvider(keyPath);
@@ -125,9 +140,25 @@ public class SshClientFactory {
         }
     }
 
+    private void rejectWorldWritableFile(Path filePath, String targetKey) {
+        try {
+            Set<PosixFilePermission> perms = Files.getPosixFilePermissions(filePath, LinkOption.NOFOLLOW_LINKS);
+            if (perms.contains(PosixFilePermission.OTHERS_WRITE)) {
+                throw new IllegalStateException(
+                        "known_hosts file permissions for target '" + targetKey
+                                + "' are too open (world-writable): " + filePath);
+            }
+        } catch (UnsupportedOperationException ignored) {
+            // Non-POSIX filesystem
+        } catch (IOException ex) {
+            throw new IllegalStateException(
+                    "Unable to inspect known_hosts permissions for target '" + targetKey + "'", ex);
+        }
+    }
+
     private void enforcePrivateKeyPermissions(Path keyPath, String targetKey) {
         try {
-            Set<PosixFilePermission> perms = Files.getPosixFilePermissions(keyPath);
+            Set<PosixFilePermission> perms = Files.getPosixFilePermissions(keyPath, LinkOption.NOFOLLOW_LINKS);
             if (perms.contains(PosixFilePermission.GROUP_READ)
                     || perms.contains(PosixFilePermission.GROUP_WRITE)
                     || perms.contains(PosixFilePermission.GROUP_EXECUTE)
@@ -148,24 +179,25 @@ public class SshClientFactory {
 
     private List<NamedFactory<Cipher>> resolveCiphers(String targetKey, List<String> names) {
         return new ArrayList<>(resolveAlgorithms(
-                targetKey, "SSH cipher", names, BuiltinCiphers::fromFactoryName));
+                targetKey, "SSH cipher", names, SftpTargetConfig.APPROVED_STRONG_CIPHERS, BuiltinCiphers::fromFactoryName));
     }
 
     private List<KeyExchangeFactory> resolveKeyExchanges(String targetKey, List<String> names) {
         List<BuiltinDHFactories> selected = resolveAlgorithms(
-                targetKey, "SSH key exchange", names, BuiltinDHFactories::fromFactoryName);
+                targetKey, "SSH key exchange", names, SftpTargetConfig.APPROVED_STRONG_KEX, BuiltinDHFactories::fromFactoryName);
         return NamedFactory.setUpTransformedFactories(false, selected, ClientBuilder.DH2KEX);
     }
 
     private List<NamedFactory<Mac>> resolveMacs(String targetKey, List<String> names) {
         return new ArrayList<>(resolveAlgorithms(
-                targetKey, "SSH MAC", names, BuiltinMacs::fromFactoryName));
+                targetKey, "SSH MAC", names, SftpTargetConfig.APPROVED_STRONG_MACS, BuiltinMacs::fromFactoryName));
     }
 
     private <T extends OptionalFeature> List<T> resolveAlgorithms(
             String targetKey,
             String algorithmKind,
             List<String> names,
+            Set<String> approvedAllowlist,
             Function<String, T> lookup
     ) {
         if (names == null || names.isEmpty()) {
@@ -174,6 +206,10 @@ public class SshClientFactory {
         }
         List<T> selected = new ArrayList<>(names.size());
         for (String name : names) {
+            if (!approvedAllowlist.contains(name)) {
+                throw new IllegalArgumentException(
+                        "Disallowed or weak " + algorithmKind + " '" + name + "' configured for target '" + targetKey + "'");
+            }
             T algorithm = lookup.apply(name);
             if (algorithm == null) {
                 throw new IllegalArgumentException(

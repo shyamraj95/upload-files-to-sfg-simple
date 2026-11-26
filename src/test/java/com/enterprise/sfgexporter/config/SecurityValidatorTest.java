@@ -199,6 +199,101 @@ class SecurityValidatorTest {
                 .hasMessageContaining("world-writable");
     }
 
+    @Test
+    void rejectsWeakSshAlgorithms() {
+        AppProperties props1 = buildValidProperties();
+        props1.getSftpTargets().get("sfg-primary").setAllowedCiphers(List.of("none"));
+        assertThatThrownBy(() -> new SecurityValidator(props1).validateAll(props1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("disallowed or weak");
+
+        AppProperties props2 = buildValidProperties();
+        props2.getSftpTargets().get("sfg-primary").setAllowedKeyExchanges(List.of("diffie-hellman-group1-sha1"));
+        assertThatThrownBy(() -> new SecurityValidator(props2).validateAll(props2))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("disallowed or weak");
+
+        AppProperties props3 = buildValidProperties();
+        props3.getSftpTargets().get("sfg-primary").setAllowedMacs(List.of("hmac-md5"));
+        assertThatThrownBy(() -> new SecurityValidator(props3).validateAll(props3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("disallowed or weak");
+    }
+
+    @Test
+    void rejectsOverlappingOrNestedStagingAndBackupDirs(@TempDir Path tempDir) {
+        AppProperties sameDir = buildValidProperties();
+        sameDir.getStorage().setStagingDir(tempDir.toString());
+        sameDir.getStorage().setBackupDir(tempDir.toString());
+        assertThatThrownBy(() -> new SecurityValidator(sameDir).validateAll(sameDir))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("distinct, non-nested");
+
+        AppProperties nestedDir = buildValidProperties();
+        nestedDir.getStorage().setStagingDir(tempDir.resolve("backup/staging").toString());
+        nestedDir.getStorage().setBackupDir(tempDir.resolve("backup").toString());
+        assertThatThrownBy(() -> new SecurityValidator(nestedDir).validateAll(nestedDir))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("distinct, non-nested");
+    }
+
+    @Test
+    void rejectsUncFileSqlUriAndSymlinkExternalSqlFile(@TempDir Path tempDir) throws Exception {
+        AppProperties uncProps = buildValidProperties();
+        ExportJobConfig uncJob = uncProps.getJobs().getFirst();
+        uncJob.setSourceType(SourceType.SQL_QUERY);
+        uncJob.setSqlFile("file://evil-host/share/query.sql");
+        assertThatThrownBy(() -> new SecurityValidator(uncProps).validateAll(uncProps))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("sql-file");
+
+        Path sqlDir = Files.createDirectories(tempDir.resolve("sql"));
+        Path targetSql = Files.writeString(tempDir.resolve("real.sql"), "SELECT 1 FROM DUAL");
+        Path symlinkSql = Files.createSymbolicLink(sqlDir.resolve("link.sql"), targetSql);
+
+        AppProperties symProps = buildValidProperties();
+        symProps.getStorage().setSqlDir(sqlDir.toString());
+        ExportJobConfig symJob = symProps.getJobs().getFirst();
+        symJob.setSourceType(SourceType.SQL_QUERY);
+        symJob.setSqlFile("file:" + symlinkSql.toAbsolutePath());
+
+        assertThatThrownBy(() -> new SecurityValidator(symProps).validateAll(symProps))
+                .isInstanceOf(SecurityException.class)
+                .hasMessageContaining("symlink");
+    }
+
+    @Test
+    void rejectsUnsafeRemotePathSegmentsAndInvalidHost() {
+        AppProperties badRemote = buildValidProperties();
+        badRemote.getJobs().getFirst().setRemoteDir("/finance//./gl");
+        assertThatThrownBy(() -> new SecurityValidator(badRemote).validateAll(badRemote))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("remote-dir");
+
+        AppProperties badHost = buildValidProperties();
+        badHost.getSftpTargets().get("sfg-primary").setHost("sfg.example.com\nEvil");
+        assertThatThrownBy(() -> new SecurityValidator(badHost).validateAll(badHost))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("host");
+    }
+
+    @Test
+    void rejectsInvalidOrSymlinkSqlDirAtStartup(@TempDir Path tempDir) throws Exception {
+        AppProperties missingDirProps = buildValidProperties();
+        missingDirProps.getStorage().setSqlDir(tempDir.resolve("missing_sql_dir").toString());
+        assertThatThrownBy(() -> new SecurityValidator(missingDirProps).validateAll(missingDirProps))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("app.storage.sql-dir");
+
+        Path realDir = Files.createDirectories(tempDir.resolve("real_sql"));
+        Path symlinkDir = Files.createSymbolicLink(tempDir.resolve("sym_sql"), realDir);
+        AppProperties symDirProps = buildValidProperties();
+        symDirProps.getStorage().setSqlDir(symlinkDir.toString());
+        assertThatThrownBy(() -> new SecurityValidator(symDirProps).validateAll(symDirProps))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("app.storage.sql-dir");
+    }
+
     private AppProperties buildValidProperties() {
         SftpTargetConfig target = new SftpTargetConfig();
         target.setHost("sfg.example.com");

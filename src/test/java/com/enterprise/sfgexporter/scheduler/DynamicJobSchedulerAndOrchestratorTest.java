@@ -10,11 +10,13 @@ import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -86,5 +88,32 @@ class DynamicJobSchedulerAndOrchestratorTest {
         verify(extractor).extractToCsv(job);
         verify(uploader).uploadAtomically(stagedPath, "sfg-primary", "/finance");
         verify(backup).archiveToBackup(stagedPath);
+    }
+
+    @Test
+    void returnsFailedAndDoesNotRetryUploadWhenArchiveFailsAfterUpload() throws Exception {
+        OracleDataExtractor extractor = mock(OracleDataExtractor.class);
+        AtomicSftpUploader uploader = mock(AtomicSftpUploader.class);
+        BackupRetentionService backup = mock(BackupRetentionService.class);
+
+        ExportJobConfig job = new ExportJobConfig();
+        job.setName("archive_fail_job");
+        job.setSftpTarget("sfg-primary");
+        job.setRemoteDir("/finance");
+
+        Path stagedPath = Path.of("/tmp/staging/GL_ARCHIVE_FAIL.csv");
+        when(extractor.extractToCsv(job))
+                .thenReturn(new StreamingCsvWriter.StagedCsvFile(stagedPath, "GL_ARCHIVE_FAIL.csv", 10L));
+        when(uploader.uploadAtomically(stagedPath, "sfg-primary", "/finance"))
+                .thenReturn("/inbound/finance/GL_ARCHIVE_FAIL.csv");
+        when(backup.archiveToBackup(stagedPath)).thenThrow(new IOException("Backup disk full"));
+
+        ExportJobOrchestrator orchestrator = new ExportJobOrchestrator(extractor, uploader, backup);
+        JobExecutionResult result = orchestrator.executeJob(job);
+
+        assertThat(result.status()).isEqualTo(JobExecutionResult.Status.FAILED);
+        assertThat(result.errorMessage()).contains("Backup disk full");
+        verify(uploader, times(1)).uploadAtomically(stagedPath, "sfg-primary", "/finance");
+        verify(backup, times(1)).archiveToBackup(stagedPath);
     }
 }

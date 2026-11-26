@@ -26,6 +26,9 @@ import java.security.KeyPairGenerator;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -293,6 +296,132 @@ class AtomicSftpUploaderIntegrationTest {
         assertThatThrownBy(() -> uploader.uploadAtomically(localCsv, "sfg-bad-key", "/finance"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("too open");
+    }
+
+    @Test
+    void rejectsSymlinkLocalFileAndSlashesInFileName() throws Exception {
+        Path outsideTarget = Files.writeString(tempDir.resolve("secret.csv"), "SECRET\n", StandardCharsets.UTF_8);
+        Path symlinkCsv = Files.createSymbolicLink(tempDir.resolve("link.csv"), outsideTarget);
+
+        SftpSessionFactoryRegistry mockRegistry = mock(SftpSessionFactoryRegistry.class);
+        AtomicSftpUploader uploader = new AtomicSftpUploader(mockRegistry);
+
+        assertThatThrownBy(() -> uploader.uploadAtomically(symlinkCsv, "sfg-test", "/finance"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("symbolic link");
+
+        assertThatThrownBy(() -> uploader.buildRemotePath("/inbound", "/finance", "../evil.csv"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("fileName");
+    }
+
+    @Test
+    void handlesCyclicExceptionCausesAndSanitizesControlChars() {
+        SftpSessionFactoryRegistry mockRegistry = mock(SftpSessionFactoryRegistry.class);
+        AtomicSftpUploader uploader = new AtomicSftpUploader(mockRegistry);
+
+        RuntimeException outer = new RuntimeException("line1\r\n\u001Bline2");
+        RuntimeException inner = new RuntimeException("line1\r\n\u001Bline2", outer);
+        outer.initCause(inner);
+
+        assertThat(uploader.isNonRetryable(outer)).isFalse();
+        String summary = uploader.summarizeException(outer);
+        assertThat(summary).doesNotContain("\r", "\n", "\u001B");
+        assertThat(summary).contains("line1 line2");
+    }
+
+    @Test
+    void sshClientFactoryRejectsWorldWritableKnownHostsAndWeakCipherDirectly() throws Exception {
+        SshClientFactory factory = new SshClientFactory();
+
+        SftpTargetConfig weakCipherTarget = createTargetConfig(knownHostsFile.toString());
+        weakCipherTarget.setAllowedCiphers(List.of("3des-cbc"));
+        assertThatThrownBy(() -> factory.createHardenedClient("sfg-weak", weakCipherTarget))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Disallowed or weak");
+
+        try {
+            Files.setPosixFilePermissions(knownHostsFile, PosixFilePermissions.fromString("rw-r--rw-"));
+        } catch (UnsupportedOperationException ex) {
+            return; // Non-POSIX filesystem
+        }
+        SftpTargetConfig openKnownHostsTarget = createTargetConfig(knownHostsFile.toString());
+        assertThatThrownBy(() -> factory.createHardenedClient("sfg-open-kh", openKnownHostsTarget))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("world-writable");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void releasesBulkheadDuringRetryBackoffSoConcurrentUploadSucceeds() throws Exception {
+        Path localCsv1 = Files.writeString(tempDir.resolve("CONCURRENT_1.csv"), "A\n1\n", StandardCharsets.UTF_8);
+        Path localCsv2 = Files.writeString(tempDir.resolve("CONCURRENT_2.csv"), "A\n2\n", StandardCharsets.UTF_8);
+
+        SftpTargetConfig target = createTargetConfig(knownHostsFile.toString());
+        target.setMaxConcurrentUploads(1);
+        target.setConnectTimeoutMs(150L);
+        RetryConfig retry = new RetryConfig();
+        retry.setMaxAttempts(2);
+        retry.setInitialBackoffMs(500L);
+        retry.setMultiplier(1.0);
+        retry.setMaxBackoffMs(500L);
+        target.setRetry(retry);
+
+        SftpSessionFactoryRegistry mockRegistry = mock(SftpSessionFactoryRegistry.class);
+        SessionFactory<SftpClient.DirEntry> mockFactory = mock(SessionFactory.class);
+        Session<SftpClient.DirEntry> okSession = mock(Session.class);
+
+        CountDownLatch firstAttemptEntered = new CountDownLatch(1);
+        AtomicInteger calls = new AtomicInteger();
+        when(mockRegistry.getTargetConfig("sfg-bulkhead")).thenReturn(target);
+        when(mockRegistry.getSessionFactory("sfg-bulkhead")).thenReturn(mockFactory);
+        when(mockFactory.getSession()).thenAnswer(inv -> {
+            if (calls.incrementAndGet() == 1) {
+                firstAttemptEntered.countDown();
+                throw new IllegalStateException("Transient error", new IOException("Reset"));
+            }
+            return okSession;
+        });
+
+        AtomicSftpUploader uploader = new AtomicSftpUploader(mockRegistry);
+        CompletableFuture<String> firstUpload = CompletableFuture.supplyAsync(
+                () -> uploader.uploadAtomically(localCsv1, "sfg-bulkhead", "/finance"));
+
+        assertThat(firstAttemptEntered.await(2, TimeUnit.SECONDS)).isTrue();
+        Thread.sleep(50L);
+
+        String secondResult = uploader.uploadAtomically(localCsv2, "sfg-bulkhead", "/finance");
+        assertThat(secondResult).isEqualTo("/inbound/finance/CONCURRENT_2.csv");
+        assertThat(firstUpload.get(5, TimeUnit.SECONDS)).isEqualTo("/inbound/finance/CONCURRENT_1.csv");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void reportsActualAttemptCountOnEarlyNonRetryableFailure() throws Exception {
+        Path localCsv = Files.writeString(tempDir.resolve("AUTH_FAIL.csv"), "A\n1\n", StandardCharsets.UTF_8);
+
+        SftpTargetConfig target = createTargetConfig(knownHostsFile.toString());
+        RetryConfig retry = new RetryConfig();
+        retry.setMaxAttempts(4);
+        retry.setInitialBackoffMs(50L);
+        retry.setMaxBackoffMs(100L);
+        target.setRetry(retry);
+
+        SftpSessionFactoryRegistry mockRegistry = mock(SftpSessionFactoryRegistry.class);
+        SessionFactory<SftpClient.DirEntry> mockFactory = mock(SessionFactory.class);
+        AtomicInteger calls = new AtomicInteger();
+        when(mockRegistry.getTargetConfig("sfg-auth-fail")).thenReturn(target);
+        when(mockRegistry.getSessionFactory("sfg-auth-fail")).thenReturn(mockFactory);
+        when(mockFactory.getSession()).thenAnswer(inv -> {
+            calls.incrementAndGet();
+            throw new IllegalStateException("Authentication failed");
+        });
+
+        AtomicSftpUploader uploader = new AtomicSftpUploader(mockRegistry);
+        assertThatThrownBy(() -> uploader.uploadAtomically(localCsv, "sfg-auth-fail", "/finance"))
+                .isInstanceOf(AtomicSftpUploader.SftpUploadException.class)
+                .hasMessageContaining("after 1 attempt(s)");
+        assertThat(calls.get()).isEqualTo(1);
     }
 
     private SftpTargetConfig createTargetConfig(String knownHostsPath) {

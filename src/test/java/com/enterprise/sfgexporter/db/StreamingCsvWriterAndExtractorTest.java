@@ -13,18 +13,22 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import javax.sql.DataSource;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.sql.Blob;
 import java.sql.CallableStatement;
 import java.sql.Clob;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLXML;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -44,6 +48,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -262,5 +267,112 @@ class StreamingCsvWriterAndExtractorTest {
         assertThatThrownBy(() -> mockExtractor.extractToCsv(job))
                 .isInstanceOf(DataAccessException.class);
         verify(mockCs).close();
+    }
+
+    @Test
+    void neutralizesLeadingWhitespaceNewlineAndFormulaHeaders() throws Exception {
+        ResultSet rs = mock(ResultSet.class);
+        ResultSetMetaData meta = mock(ResultSetMetaData.class);
+        when(rs.getMetaData()).thenReturn(meta);
+        when(meta.getColumnCount()).thenReturn(3);
+        when(meta.getColumnLabel(1)).thenReturn("=HDR");
+        when(meta.getColumnLabel(2)).thenReturn("SPACE_FORMULA");
+        when(meta.getColumnLabel(3)).thenReturn("NEWLINE_FORMULA");
+
+        when(rs.next()).thenReturn(true, false);
+        when(rs.getObject(1)).thenReturn("ok");
+        when(rs.getObject(2)).thenReturn(" =SUM(A1)");
+        when(rs.getObject(3)).thenReturn("\n=CMD");
+
+        ExportJobConfig job = new ExportJobConfig();
+        job.setName("ws_formula_test");
+        job.setFilePrefix("WS_FORMULA");
+
+        StreamingCsvWriter.StagedCsvFile staged = csvWriter.writeResultSet(rs, job);
+        String content = Files.readString(staged.filePath());
+        assertThat(content).startsWith("'=HDR,SPACE_FORMULA,NEWLINE_FORMULA\n");
+        assertThat(content).contains("' =SUM(A1),\"'\n=CMD\"");
+    }
+
+    @Test
+    void readsSqlXmlBoundedAndRejectsBlobWhileFreeingResources() throws Exception {
+        SQLXML sqlxml = mock(SQLXML.class);
+        when(sqlxml.getCharacterStream()).thenReturn(new StringReader("=XML_FORMULA"));
+
+        ResultSet xmlRs = mock(ResultSet.class);
+        ResultSetMetaData xmlMeta = mock(ResultSetMetaData.class);
+        when(xmlRs.getMetaData()).thenReturn(xmlMeta);
+        when(xmlMeta.getColumnCount()).thenReturn(1);
+        when(xmlMeta.getColumnLabel(1)).thenReturn("XML_COL");
+        when(xmlRs.next()).thenReturn(true, false);
+        when(xmlRs.getObject(1)).thenReturn(sqlxml);
+
+        ExportJobConfig xmlJob = new ExportJobConfig();
+        xmlJob.setName("xml_test");
+        xmlJob.setFilePrefix("XML_TEST");
+
+        StreamingCsvWriter.StagedCsvFile staged = csvWriter.writeResultSet(xmlRs, xmlJob);
+        assertThat(Files.readAllLines(staged.filePath()).get(1)).isEqualTo("'=XML_FORMULA");
+        verify(sqlxml).free();
+
+        Blob blob = mock(Blob.class);
+        ResultSet blobRs = mock(ResultSet.class);
+        ResultSetMetaData blobMeta = mock(ResultSetMetaData.class);
+        when(blobRs.getMetaData()).thenReturn(blobMeta);
+        when(blobMeta.getColumnCount()).thenReturn(1);
+        when(blobMeta.getColumnLabel(1)).thenReturn("BLOB_COL");
+        when(blobRs.next()).thenReturn(true, false);
+        when(blobRs.getObject(1)).thenReturn(blob);
+
+        ExportJobConfig blobJob = new ExportJobConfig();
+        blobJob.setName("blob_test");
+        blobJob.setFilePrefix("BLOB_TEST");
+
+        assertThatThrownBy(() -> csvWriter.writeResultSet(blobRs, blobJob))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("BLOB");
+        verify(blob).free();
+    }
+
+    @Test
+    void rejectsOversizedExternalSqlFileBeforeExecution() throws Exception {
+        Path oversizedSql = tempDir.resolve("huge.sql");
+        Files.writeString(oversizedSql, "SELECT '" + "X".repeat(1_048_600) + "' FROM DUAL");
+
+        DataSource mockDs = mock(DataSource.class);
+        OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        ExportJobConfig job = new ExportJobConfig();
+        job.setName("huge_sql");
+        job.setSourceType(SourceType.SQL_QUERY);
+        job.setSqlFile("file:" + oversizedSql.toAbsolutePath());
+        job.setFilePrefix("HUGE_SQL");
+
+        assertThatThrownBy(() -> mockExtractor.extractToCsv(job))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("maximum allowed size");
+        verify(mockDs, never()).getConnection();
+    }
+
+    @Test
+    void closesPreparedStatementWhenSetFetchSizeThrowsDuringSqlQuery() throws Exception {
+        DataSource mockDs = mock(DataSource.class);
+        Connection mockConn = mock(Connection.class);
+        PreparedStatement mockPs = mock(PreparedStatement.class);
+
+        when(mockDs.getConnection()).thenReturn(mockConn);
+        when(mockConn.prepareStatement(anyString())).thenReturn(mockPs);
+        doThrow(new SQLException("fetchSize unsupported")).when(mockPs).setFetchSize(anyInt());
+
+        OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        ExportJobConfig job = new ExportJobConfig();
+        job.setName("sql_fetch_fail");
+        job.setSourceType(SourceType.SQL_QUERY);
+        job.setSqlFile("classpath:sql/test_export.sql");
+        job.setParameters(Map.of("status", "SETTLED"));
+        job.setFilePrefix("SQL_FETCH_FAIL");
+
+        assertThatThrownBy(() -> mockExtractor.extractToCsv(job))
+                .isInstanceOf(DataAccessException.class);
+        verify(mockPs).close();
     }
 }

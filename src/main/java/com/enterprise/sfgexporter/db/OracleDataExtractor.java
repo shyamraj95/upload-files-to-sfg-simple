@@ -14,16 +14,23 @@ import org.springframework.dao.DataRetrievalFailureException;
 import org.springframework.jdbc.core.CallableStatementCallback;
 import org.springframework.jdbc.core.CallableStatementCreator;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.PreparedStatementCreator;
+import org.springframework.jdbc.core.ResultSetExtractor;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.jdbc.core.namedparam.SqlParameterSource;
 import org.springframework.jdbc.support.JdbcUtils;
 import org.springframework.stereotype.Component;
 
 import javax.sql.DataSource;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.CallableStatement;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
@@ -31,7 +38,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Executes configured Oracle PL/SQL stored procedures ({@code SYS_REFCURSOR}) or parameterized
@@ -45,12 +51,13 @@ import java.util.concurrent.ConcurrentHashMap;
 public class OracleDataExtractor {
 
     private static final Logger log = LoggerFactory.getLogger(OracleDataExtractor.class);
+    private static final long MAX_SQL_FILE_BYTES = 1024L * 1024L;
 
-    private final DataSource dataSource;
     private final ResourceLoader resourceLoader;
     private final StreamingCsvWriter csvWriter;
     private final String allowedSqlDir;
-    private final Map<String, NamedParameterJdbcTemplate> namedTemplates = new ConcurrentHashMap<>();
+    private final JdbcTemplate jdbcTemplate;
+    private final StreamingNamedParameterJdbcTemplate namedJdbcTemplate;
 
     @Autowired
     public OracleDataExtractor(
@@ -76,10 +83,11 @@ public class OracleDataExtractor {
             StreamingCsvWriter csvWriter,
             String allowedSqlDir
     ) {
-        this.dataSource = dataSource;
         this.resourceLoader = resourceLoader;
         this.csvWriter = csvWriter;
         this.allowedSqlDir = allowedSqlDir != null ? allowedSqlDir : "";
+        this.jdbcTemplate = new JdbcTemplate(dataSource);
+        this.namedJdbcTemplate = new StreamingNamedParameterJdbcTemplate(this.jdbcTemplate);
     }
 
     /**
@@ -115,8 +123,6 @@ public class OracleDataExtractor {
         log.info("Executing Oracle PL/SQL stored procedure for job '{}' (fetchSize={}, timeout={}s)",
                 job.getName(), job.getFetchSize(), job.getQueryTimeoutSeconds());
 
-        JdbcTemplate jobJdbcTemplate = createJobJdbcTemplate(job);
-
         CallableStatementCreator creator = connection -> {
             // Forward-only, read-only cursor avoids scrollable buffer overhead inside Oracle JDBC
             CallableStatement cs = connection.prepareCall(
@@ -151,7 +157,7 @@ public class OracleDataExtractor {
         };
 
         return Objects.requireNonNull(
-                jobJdbcTemplate.execute(creator, callback),
+                jdbcTemplate.execute(creator, callback),
                 "Stored procedure extraction returned null result for job '" + job.getName() + "'");
     }
 
@@ -166,9 +172,6 @@ public class OracleDataExtractor {
         log.info("Executing parameterized SQL file '{}' for job '{}' (fetchSize={}, timeout={}s)",
                 job.getSqlFile(), job.getName(), job.getFetchSize(), job.getQueryTimeoutSeconds());
 
-        NamedParameterJdbcTemplate namedJdbc = namedTemplates.computeIfAbsent(
-                job.getName(), ignored -> new NamedParameterJdbcTemplate(createJobJdbcTemplate(job)));
-
         MapSqlParameterSource paramSource = new MapSqlParameterSource();
         for (Map.Entry<String, Object> entry : job.getParameters().entrySet()) {
             // Re-validate parameter keys as defense-in-depth before binding
@@ -177,10 +180,15 @@ public class OracleDataExtractor {
         }
 
         return Objects.requireNonNull(
-                namedJdbc.query(sql, paramSource, rs -> {
-                    rs.setFetchSize(job.getFetchSize());
-                    return writeResultSetUnchecked(rs, job);
-                }),
+                namedJdbcTemplate.queryWithStatementConfig(
+                        sql,
+                        paramSource,
+                        job.getFetchSize(),
+                        job.getQueryTimeoutSeconds(),
+                        rs -> {
+                            rs.setFetchSize(job.getFetchSize());
+                            return writeResultSetUnchecked(rs, job);
+                        }),
                 "SQL extraction returned null result for job '" + job.getName() + "'");
     }
 
@@ -213,28 +221,33 @@ public class OracleDataExtractor {
         return "{call " + target + "(" + String.join(", ", args) + ")}";
     }
 
-    /**
-     * Creates a lightweight, per-execution {@link JdbcTemplate} sharing the pooled {@link DataSource}
-     * so concurrent jobs with different {@code fetchSize} or {@code queryTimeoutSeconds} never mutate
-     * a shared singleton template.
-     */
-    private JdbcTemplate createJobJdbcTemplate(ExportJobConfig job) {
-        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
-        jdbcTemplate.setFetchSize(job.getFetchSize());
-        jdbcTemplate.setQueryTimeout(job.getQueryTimeoutSeconds());
-        return jdbcTemplate;
-    }
-
     private String loadSqlResource(String location) {
-        if (location.startsWith("file:")) {
-            SecurityValidator.validateExternalSqlFileSecurity(location, allowedSqlDir);
-        }
-        Resource resource = resourceLoader.getResource(location);
-        if (!resource.exists()) {
-            throw new IllegalStateException("SQL resource not found: " + location);
-        }
         try {
-            String sql = resource.getContentAsString(StandardCharsets.UTF_8).trim();
+            String rawSql;
+            if (location.startsWith("file:")) {
+                Path verifiedSqlPath = SecurityValidator.validateExternalSqlFileSecurity(location, allowedSqlDir);
+                long fileSize = Files.size(verifiedSqlPath);
+                if (fileSize > MAX_SQL_FILE_BYTES) {
+                    throw new IllegalStateException(
+                            "SQL resource exceeds maximum allowed size (" + MAX_SQL_FILE_BYTES + " bytes): " + location);
+                }
+                rawSql = Files.readString(verifiedSqlPath, StandardCharsets.UTF_8);
+            } else {
+                Resource resource = resourceLoader.getResource(location);
+                if (!resource.exists()) {
+                    throw new IllegalStateException("SQL resource not found: " + location);
+                }
+                try (InputStream in = resource.getInputStream()) {
+                    byte[] bytes = in.readNBytes((int) MAX_SQL_FILE_BYTES + 1);
+                    if (bytes.length > MAX_SQL_FILE_BYTES) {
+                        throw new IllegalStateException(
+                                "SQL resource exceeds maximum allowed size (" + MAX_SQL_FILE_BYTES + " bytes): " + location);
+                    }
+                    rawSql = new String(bytes, StandardCharsets.UTF_8);
+                }
+            }
+
+            String sql = rawSql.trim();
             if (sql.isEmpty()) {
                 throw new IllegalStateException("SQL resource is empty: " + location);
             }
@@ -255,6 +268,38 @@ public class OracleDataExtractor {
         } catch (IOException ex) {
             throw new DataRetrievalFailureException(
                     "Failed while streaming JDBC ResultSet to CSV for job '" + job.getName() + "'", ex);
+        }
+    }
+
+    /**
+     * Thread-safe subclass of {@link NamedParameterJdbcTemplate} allowing per-execution
+     * {@code fetchSize} and {@code queryTimeout} without allocating a new template per job.
+     */
+    private static final class StreamingNamedParameterJdbcTemplate extends NamedParameterJdbcTemplate {
+        StreamingNamedParameterJdbcTemplate(JdbcTemplate jdbcTemplate) {
+            super(jdbcTemplate);
+        }
+
+        <T> T queryWithStatementConfig(
+                String sql,
+                SqlParameterSource paramSource,
+                int fetchSize,
+                int queryTimeoutSeconds,
+                ResultSetExtractor<T> rse
+        ) {
+            PreparedStatementCreator delegate = getPreparedStatementCreator(sql, paramSource);
+            PreparedStatementCreator configured = connection -> {
+                PreparedStatement ps = delegate.createPreparedStatement(connection);
+                try {
+                    ps.setFetchSize(fetchSize);
+                    ps.setQueryTimeout(queryTimeoutSeconds);
+                    return ps;
+                } catch (SQLException | RuntimeException ex) {
+                    JdbcUtils.closeStatement(ps);
+                    throw ex;
+                }
+            };
+            return getJdbcOperations().query(configured, rse);
         }
     }
 }

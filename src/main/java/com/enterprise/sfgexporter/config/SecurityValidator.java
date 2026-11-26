@@ -17,6 +17,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.time.ZoneId;
@@ -66,6 +67,21 @@ public class SecurityValidator implements InitializingBean {
     /** Allowed Spring resource URIs for external SQL files (must end in {@code .sql}). */
     private static final Pattern SAFE_SQL_RESOURCE_PATTERN = Pattern.compile("^(classpath:|file:)[\\w./-]+\\.sql$");
 
+    /** Allowed SFTP target hostnames / IPv4 / IPv6 addresses (blocks whitespace, control chars, slashes, '@'). */
+    private static final Pattern SAFE_HOST_PATTERN = Pattern.compile("^[a-zA-Z0-9._:-]+$");
+
+    /** Allowed SFTP login usernames (printable non-whitespace ASCII only; blocks CRLF/control chars). */
+    private static final Pattern SAFE_USERNAME_PATTERN = Pattern.compile("^[\\x21-\\x7E]+$");
+
+    /** Allowed SFTP target key identifiers under {@code app.sftp-targets}. */
+    private static final Pattern SAFE_TARGET_KEY_PATTERN = Pattern.compile("^[\\w.-]+$");
+
+    /** Allowed single-segment CSV filenames (blocks path separators and traversal). */
+    private static final Pattern SAFE_FILENAME_PATTERN = Pattern.compile("^[\\w.-]+$");
+
+    private static final int MAX_RETRY_ATTEMPTS = 20;
+    private static final long MAX_RETRY_BACKOFF_MS = 300_000L;
+
     private final AppProperties properties;
     private final ResourceLoader resourceLoader;
 
@@ -111,6 +127,19 @@ public class SecurityValidator implements InitializingBean {
     private void validateStorage(AppProperties.StorageConfig storage) {
         requireNonBlank(storage.getStagingDir(), "app.storage.staging-dir");
         requireNonBlank(storage.getBackupDir(), "app.storage.backup-dir");
+        Path staging = Path.of(storage.getStagingDir()).toAbsolutePath().normalize();
+        Path backup = Path.of(storage.getBackupDir()).toAbsolutePath().normalize();
+        if (staging.equals(backup) || staging.startsWith(backup) || backup.startsWith(staging)) {
+            throw new IllegalArgumentException(
+                    "app.storage.staging-dir and app.storage.backup-dir must be distinct, non-nested directories");
+        }
+        if (isNotBlank(storage.getSqlDir())) {
+            Path sqlDir = Path.of(storage.getSqlDir()).toAbsolutePath().normalize();
+            if (Files.isSymbolicLink(sqlDir) || !Files.isDirectory(sqlDir, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IllegalArgumentException(
+                        "app.storage.sql-dir must be an existing non-symlink directory: " + sqlDir);
+            }
+        }
         requireMin(storage.getRetentionDays(), 1, "app.storage.retention-days");
         requireMin(storage.getStagingPartMaxAgeHours(), 1, "app.storage.staging-part-max-age-hours");
         validateCron(storage.getCleanupCron(), "app.storage.cleanup-cron");
@@ -205,15 +234,27 @@ public class SecurityValidator implements InitializingBean {
     }
 
     public void validateSftpTarget(String targetKey, SftpTargetConfig target, boolean allowInsecureSftpDevMode) {
+        if (targetKey == null || !SAFE_TARGET_KEY_PATTERN.matcher(targetKey).matches()) {
+            throw new IllegalArgumentException(
+                    "Invalid SFTP target key: must match " + SAFE_TARGET_KEY_PATTERN.pattern());
+        }
         String prefix = "app.sftp-targets." + targetKey;
         if (target == null) {
             throw new IllegalArgumentException(prefix + " must not be null");
         }
         requireNonBlank(target.getHost(), prefix + ".host");
+        if (!SAFE_HOST_PATTERN.matcher(target.getHost()).matches()) {
+            throw new IllegalArgumentException(
+                    prefix + ".host contains invalid or unsafe characters");
+        }
         if (target.getPort() < 1 || target.getPort() > 65535) {
             throw new IllegalArgumentException(prefix + ".port must be between 1 and 65535");
         }
         requireNonBlank(target.getUsername(), prefix + ".username");
+        if (!SAFE_USERNAME_PATTERN.matcher(target.getUsername()).matches()) {
+            throw new IllegalArgumentException(
+                    prefix + ".username contains invalid or control characters");
+        }
 
         validateSftpSecuritySettings(targetKey, target, prefix, allowInsecureSftpDevMode);
 
@@ -256,17 +297,31 @@ public class SecurityValidator implements InitializingBean {
                     + "Do NOT disable host key verification in production!", targetKey);
         }
 
-        requireNonEmptyList(target.getAllowedCiphers(), prefix + ".allowed-ciphers");
-        requireNonEmptyList(target.getAllowedKeyExchanges(), prefix + ".allowed-key-exchanges");
-        requireNonEmptyList(target.getAllowedMacs(), prefix + ".allowed-macs");
+        validateAlgorithmAllowlist(
+                target.getAllowedCiphers(), SftpTargetConfig.APPROVED_STRONG_CIPHERS, prefix + ".allowed-ciphers");
+        validateAlgorithmAllowlist(
+                target.getAllowedKeyExchanges(), SftpTargetConfig.APPROVED_STRONG_KEX, prefix + ".allowed-key-exchanges");
+        validateAlgorithmAllowlist(
+                target.getAllowedMacs(), SftpTargetConfig.APPROVED_STRONG_MACS, prefix + ".allowed-macs");
+    }
+
+    private void validateAlgorithmAllowlist(List<String> configured, Set<String> approved, String fieldName) {
+        requireNonEmptyList(configured, fieldName);
+        for (String algorithm : configured) {
+            if (algorithm == null || !approved.contains(algorithm)) {
+                throw new IllegalArgumentException(
+                        fieldName + " contains disallowed or weak SSH algorithm: '" + algorithm + "'");
+            }
+        }
     }
 
     private void validateRetryConfig(RetryConfig retry, String prefix) {
         if (retry == null) {
             throw new IllegalArgumentException(prefix + " must not be null");
         }
-        if (retry.getMaxAttempts() < 1) {
-            throw new IllegalArgumentException(prefix + ".max-attempts must be >= 1");
+        if (retry.getMaxAttempts() < 1 || retry.getMaxAttempts() > MAX_RETRY_ATTEMPTS) {
+            throw new IllegalArgumentException(
+                    prefix + ".max-attempts must be between 1 and " + MAX_RETRY_ATTEMPTS);
         }
         if (retry.getInitialBackoffMs() < 0) {
             throw new IllegalArgumentException(prefix + ".initial-backoff-ms must be >= 0");
@@ -274,8 +329,10 @@ public class SecurityValidator implements InitializingBean {
         if (retry.getMultiplier() < 1.0) {
             throw new IllegalArgumentException(prefix + ".multiplier must be >= 1.0");
         }
-        if (retry.getMaxBackoffMs() < retry.getInitialBackoffMs()) {
-            throw new IllegalArgumentException(prefix + ".max-backoff-ms must be >= initial-backoff-ms");
+        if (retry.getMaxBackoffMs() < retry.getInitialBackoffMs()
+                || retry.getMaxBackoffMs() > MAX_RETRY_BACKOFF_MS) {
+            throw new IllegalArgumentException(
+                    prefix + ".max-backoff-ms must be >= initial-backoff-ms and <= " + MAX_RETRY_BACKOFF_MS);
         }
     }
 
@@ -289,6 +346,10 @@ public class SecurityValidator implements InitializingBean {
         if (csv.getQuoteChar() != null && csv.getQuoteChar().length() > 1) {
             throw new IllegalArgumentException(prefix + ".quote-char must be empty or 1 character");
         }
+        if (csv.getRecordSeparator() == null || csv.getRecordSeparator().isEmpty()) {
+            throw new IllegalArgumentException(prefix + ".record-separator must not be empty");
+        }
+        requireNonBlank(csv.getCharset(), prefix + ".charset");
         if (!Charset.isSupported(csv.getCharset())) {
             throw new IllegalArgumentException(prefix + ".charset is not supported: " + csv.getCharset());
         }
@@ -330,7 +391,10 @@ public class SecurityValidator implements InitializingBean {
 
     public static void validateSqlFileLocation(String sqlFile, String fieldName) {
         requireNonBlank(sqlFile, fieldName);
-        if (sqlFile.contains("..") || sqlFile.contains("\\") || !SAFE_SQL_RESOURCE_PATTERN.matcher(sqlFile).matches()) {
+        if (sqlFile.contains("..")
+                || sqlFile.contains("\\")
+                || sqlFile.contains("//")
+                || !SAFE_SQL_RESOURCE_PATTERN.matcher(sqlFile).matches()) {
             throw new IllegalArgumentException(
                     "Unsafe or invalid " + fieldName + ": must be a safe classpath: or file: .sql resource without path traversal");
         }
@@ -342,25 +406,50 @@ public class SecurityValidator implements InitializingBean {
         }
         if (remotePath.contains("..")
                 || remotePath.contains("\\")
+                || remotePath.contains("//")
+                || remotePath.equals(".")
+                || remotePath.startsWith("./")
+                || remotePath.endsWith("/.")
+                || remotePath.contains("/./")
                 || !SAFE_REMOTE_PATH_PATTERN.matcher(remotePath).matches()) {
             throw new IllegalArgumentException(
                     "Unsafe " + fieldName + ": path traversal and control characters are prohibited");
         }
     }
 
+    public static void validateSafeFileName(String fileName, String fieldName) {
+        requireNonBlank(fileName, fieldName);
+        if (".".equals(fileName)
+                || "..".equals(fileName)
+                || fileName.contains("..")
+                || fileName.contains("/")
+                || fileName.contains("\\")
+                || !SAFE_FILENAME_PATTERN.matcher(fileName).matches()) {
+            throw new IllegalArgumentException(
+                    "Unsafe " + fieldName + ": must be a single safe filename without path separators");
+        }
+    }
+
     /**
-     * Enforces base-directory confinement (when {@code allowedSqlDir} is configured) and rejects
-     * world-writable external {@code file:} SQL resources to mitigate runtime SQL tampering.
+     * Enforces symlink rejection, base-directory confinement (when {@code allowedSqlDir} is configured),
+     * and non-world-writability on external {@code file:} SQL resources, returning the verified real path.
      */
-    public static void validateExternalSqlFileSecurity(String fileResourceUri, String allowedSqlDir) {
+    public static Path validateExternalSqlFileSecurity(String fileResourceUri, String allowedSqlDir) {
         Path rawPath = Path.of(fileResourceUri.substring("file:".length()));
+        if (Files.isSymbolicLink(rawPath)) {
+            throw new SecurityException("Refusing to execute symlink SQL file: " + rawPath.getFileName());
+        }
         try {
             Path realSqlPath = rawPath.toRealPath();
+            if (!Files.isRegularFile(realSqlPath, LinkOption.NOFOLLOW_LINKS)) {
+                throw new SecurityException("SQL path is not a regular file: " + realSqlPath.getFileName());
+            }
             if (isNotBlank(allowedSqlDir)) {
                 Path realSqlDir = Path.of(allowedSqlDir).toRealPath();
                 ensureChildPath(realSqlDir, realSqlPath);
             }
             rejectWorldWritable(realSqlPath);
+            return realSqlPath;
         } catch (IOException ex) {
             throw new IllegalArgumentException(
                     "Unable to verify external SQL file security for '" + fileResourceUri + "': " + ex.getMessage(), ex);
