@@ -1,11 +1,13 @@
 package com.enterprise.sfgexporter.backup;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import com.enterprise.sfgexporter.scheduler.BackupRetentionService;
 
 import java.io.IOException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -85,7 +87,7 @@ class BackupRetentionServiceTest {
         Path stagingDir = Files.createDirectories(tempDir.resolve("staging"));
         Path backupDir = Files.createDirectories(tempDir.resolve("backup"));
         Path outsideTarget = Files.writeString(tempDir.resolve("outside.csv"), "secret");
-        Path symlink = Files.createSymbolicLink(stagingDir.resolve("evil.csv"), outsideTarget);
+        Path symlink = createSymlinkOrSkip(stagingDir.resolve("evil.csv"), outsideTarget);
 
         Clock fixedClock = Clock.fixed(Instant.parse("2026-11-22T02:00:00Z"), ZoneId.of("UTC"));
         BackupRetentionService service = new BackupRetentionService(
@@ -108,7 +110,7 @@ class BackupRetentionServiceTest {
         Path outsideTarget = Files.writeString(tempDir.resolve("keep_outside.txt"), "do-not-delete");
 
         Path expiredFolder = Files.createDirectories(backupDir.resolve("2026-11-01"));
-        Files.createSymbolicLink(expiredFolder.resolve("link.csv"), outsideTarget);
+        createSymlinkOrSkip(expiredFolder.resolve("link.csv"), outsideTarget);
 
         Clock fixedClock = Clock.fixed(Instant.parse("2026-11-22T02:00:00Z"), ZoneId.of("UTC"));
         BackupRetentionService service = new BackupRetentionService(
@@ -161,7 +163,7 @@ class BackupRetentionServiceTest {
         Path stagingDir = Files.createDirectories(tempDir.resolve("staging"));
         Path backupDir = Files.createDirectories(tempDir.resolve("backup"));
         Path outsideDir = Files.createDirectories(tempDir.resolve("outside"));
-        Files.createSymbolicLink(backupDir.resolve("2026-11-22"), outsideDir);
+        createSymlinkOrSkip(backupDir.resolve("2026-11-22"), outsideDir);
 
         Path stagedCsv = Files.writeString(stagingDir.resolve("GL_20261122.csv"), "A\n1\n");
         Clock fixedClock = Clock.fixed(Instant.parse("2026-11-22T02:00:00Z"), ZoneId.of("UTC"));
@@ -184,7 +186,7 @@ class BackupRetentionServiceTest {
         Path outsideTarget = Files.writeString(tempDir.resolve("keep.txt"), "keep");
 
         Path symlinkFolder = Files.createDirectories(backupDir.resolve("2026-11-01"));
-        Files.createSymbolicLink(symlinkFolder.resolve("link.csv"), outsideTarget);
+        createSymlinkOrSkip(symlinkFolder.resolve("link.csv"), outsideTarget);
 
         Path cleanExpiredFolder = Files.createDirectories(backupDir.resolve("2026-11-02"));
         Files.writeString(cleanExpiredFolder.resolve("OLD.csv"), "old");
@@ -209,7 +211,7 @@ class BackupRetentionServiceTest {
     void refusesToArchiveWhenBackupRootIsSymlink() throws Exception {
         Path stagingDir = Files.createDirectories(tempDir.resolve("staging"));
         Path realBackupDir = Files.createDirectories(tempDir.resolve("real_backup"));
-        Path symlinkBackupRoot = Files.createSymbolicLink(tempDir.resolve("backup_link"), realBackupDir);
+        Path symlinkBackupRoot = createSymlinkOrSkip(tempDir.resolve("backup_link"), realBackupDir);
 
         Path stagedCsv = Files.writeString(stagingDir.resolve("GL_ROOT_SYM.csv"), "A\n1\n");
         Clock fixedClock = Clock.fixed(Instant.parse("2026-11-22T02:00:00Z"), ZoneId.of("UTC"));
@@ -219,6 +221,16 @@ class BackupRetentionServiceTest {
         assertThatThrownBy(() -> service.archiveToBackup(stagedCsv))
                 .isInstanceOf(SecurityException.class)
                 .hasMessageContaining("symbolic link backup root");
+    }
+
+    private Path createSymlinkOrSkip(Path link, Path target) throws IOException {
+        try {
+            return Files.createSymbolicLink(link, target);
+        } catch (FileSystemException | UnsupportedOperationException ex) {
+            Assumptions.assumeTrue(false,
+                    "Skipping symlink assertion (OS privilege unavailable): " + ex.getMessage());
+            return null;
+        }
     }
 
     /**

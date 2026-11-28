@@ -1,28 +1,41 @@
 package com.enterprise.sfgexporter.config;
 
-import com.enterprise.sfgexporter.model.ExportJobConfig;
-import com.enterprise.sfgexporter.model.SftpTargetConfig;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.boot.context.properties.bind.DefaultValue;
-
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
+
+import com.enterprise.sfgexporter.model.ExportJobConfig;
+import com.enterprise.sfgexporter.model.SftpTargetConfig;
+
 /**
- * Immutable root configuration properties record bound from the {@code app.*} namespace in {@code application.yml}.
+ * Immutable root configuration properties record bound from the {@code app.*}
+ * namespace in {@code application.yml}.
  *
- * <p>Component Javadocs in this record and its nested records are compiled by
- * {@code spring-boot-configuration-processor} into {@code META-INF/spring-configuration-metadata.json}
- * so IDEs provide inline documentation and validation when editing YAML pipelines.</p>
+ * <p>
+ * Component Javadocs in this record and its nested records are compiled by
+ * {@code spring-boot-configuration-processor} into
+ * {@code META-INF/spring-configuration-metadata.json}
+ * so IDEs provide inline documentation and validation when editing YAML
+ * pipelines.
+ * </p>
  *
- * @param storage                   Local filesystem paths and retention cleanup schedule for staging and backup CSVs.
- * @param scheduler                 Dedicated worker thread pool sizing and graceful shutdown configuration.
- * @param sftpTargets               Named IBM SFG SFTP target definitions referenced by {@code app.jobs[].sftp-target}.
- * @param jobs                      Declarative list of independent Oracle-to-SFG export pipelines.
- * @param allowInsecureSftpDevMode  Explicit opt-in required before any SFTP target may set {@code strict-host-key-checking: false}.
+ * @param storage                  Local filesystem paths and retention cleanup
+ *                                 schedule for staging and backup CSVs.
+ * @param scheduler                Dedicated worker thread pool sizing and
+ *                                 graceful shutdown configuration.
+ * @param sftpTargets              Named IBM SFG SFTP target definitions
+ *                                 referenced by {@code app.jobs[].sftp-target}.
+ * @param jobs                     Declarative list of independent Oracle-to-SFG
+ *                                 export pipelines.
+ * @param allowInsecureSftpDevMode Explicit opt-in required before any SFTP
+ *                                 target may set
+ *                                 {@code strict-host-key-checking: false}.
  */
 @ConfigurationProperties(prefix = "app")
 public record AppProperties(
@@ -30,8 +43,7 @@ public record AppProperties(
         @DefaultValue SchedulerConfig scheduler,
         Map<String, SftpTargetConfig> sftpTargets,
         List<ExportJobConfig> jobs,
-        @DefaultValue("false") boolean allowInsecureSftpDevMode
-) {
+        @DefaultValue("false") boolean allowInsecureSftpDevMode) {
 
     public AppProperties {
         storage = storage != null ? storage : StorageConfig.defaults();
@@ -101,13 +113,21 @@ public record AppProperties(
     /**
      * Local filesystem directories and automated retention cleanup settings.
      *
-     * @param stagingDir             Directory where CSV files are streamed before SFTP upload.
-     * @param backupDir              Root archive directory containing {@code yyyy-MM-dd/} folders of uploaded CSVs.
-     * @param sqlDir                 Optional allowlisted base directory confining external {@code file:} SQL resources.
-     * @param retentionDays          Number of days to retain local backup CSVs (and failed staged CSVs) before deletion.
-     * @param stagingPartMaxAgeHours Age in hours after which crash-orphaned {@code .part} files in {@code staging/} are purged.
-     * @param cleanupCron            Spring 6-field cron expression for the daily backup cleanup sweep.
-     * @param cleanupTimeZone        IANA time zone ID used to evaluate {@code cleanupCron} and backup date folders.
+     * @param stagingDir             Directory where CSV files are streamed before
+     *                               SFTP upload.
+     * @param backupDir              Root archive directory containing
+     *                               {@code yyyy-MM-dd/} folders of uploaded CSVs.
+     * @param sqlDir                 Optional allowlisted base directory confining
+     *                               external {@code file:} SQL resources.
+     * @param retentionDays          Number of days to retain local backup CSVs (and
+     *                               failed staged CSVs) before deletion.
+     * @param stagingPartMaxAgeHours Age in hours after which crash-orphaned
+     *                               {@code .part} files in {@code staging/} are
+     *                               purged.
+     * @param cleanupCron            Spring 6-field cron expression for the daily
+     *                               backup cleanup sweep.
+     * @param cleanupTimeZone        IANA time zone ID used to evaluate
+     *                               {@code cleanupCron} and backup date folders.
      */
     public record StorageConfig(
             @DefaultValue("./data/staging") String stagingDir,
@@ -116,8 +136,7 @@ public record AppProperties(
             @DefaultValue("15") int retentionDays,
             @DefaultValue("24") int stagingPartMaxAgeHours,
             @DefaultValue("0 0 2 * * *") String cleanupCron,
-            @DefaultValue("UTC") String cleanupTimeZone
-    ) {
+            @DefaultValue("UTC+05:30") String cleanupTimeZone) {
 
         public StorageConfig {
             sqlDir = sqlDir != null ? sqlDir : "";
@@ -149,7 +168,7 @@ public record AppProperties(
             private int retentionDays = 15;
             private int stagingPartMaxAgeHours = 24;
             private String cleanupCron = "0 0 2 * * *";
-            private String cleanupTimeZone = "UTC";
+            private String cleanupTimeZone = ZoneId.systemDefault().getId();
 
             public Builder stagingDir(String stagingDir) {
                 this.stagingDir = stagingDir;
@@ -194,8 +213,7 @@ public record AppProperties(
                         retentionDays,
                         stagingPartMaxAgeHours,
                         cleanupCron,
-                        cleanupTimeZone
-                );
+                        cleanupTimeZone);
             }
         }
     }
@@ -203,15 +221,17 @@ public record AppProperties(
     /**
      * Thread pool configuration for Spring's {@code ThreadPoolTaskScheduler}.
      *
-     * @param poolSize                Maximum number of export/cleanup jobs that may execute concurrently on this node.
-     * @param threadNamePrefix        Thread name prefix used in logs and thread dumps for scheduled worker threads.
-     * @param awaitTerminationSeconds Maximum seconds to wait for in-flight jobs to finish during graceful shutdown.
+     * @param poolSize                Maximum number of export/cleanup jobs that may
+     *                                execute concurrently on this node.
+     * @param threadNamePrefix        Thread name prefix used in logs and thread
+     *                                dumps for scheduled worker threads.
+     * @param awaitTerminationSeconds Maximum seconds to wait for in-flight jobs to
+     *                                finish during graceful shutdown.
      */
     public record SchedulerConfig(
             @DefaultValue("4") int poolSize,
             @DefaultValue("sfg-job-") String threadNamePrefix,
-            @DefaultValue("60") int awaitTerminationSeconds
-    ) {
+            @DefaultValue("60") int awaitTerminationSeconds) {
 
         public static SchedulerConfig defaults() {
             return builder().build();

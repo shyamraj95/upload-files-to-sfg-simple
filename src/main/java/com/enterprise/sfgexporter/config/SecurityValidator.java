@@ -86,10 +86,11 @@ public class SecurityValidator implements InitializingBean {
     private static final Pattern SAFE_REMOTE_PATH_PATTERN = Pattern.compile("^[\\w./-]*$");
 
     /**
-     * Allowed Spring resource URIs for external SQL files (must end in
-     * {@code .sql}).
+     * Allowed Spring resource URIs for external SQL files (must end in {@code .sql};
+     * allows forward-slash Windows drive letters under {@code file:}).
      */
-    private static final Pattern SAFE_SQL_RESOURCE_PATTERN = Pattern.compile("^(classpath:|file:)[\\w./-]+\\.sql$");
+    private static final Pattern SAFE_SQL_RESOURCE_PATTERN =
+            Pattern.compile("^(classpath:[\\w./-]+|file:(?:[a-zA-Z]:)?[\\w./-]+)\\.sql$");
 
     /**
      * Allowed SFTP target hostnames / IPv4 / IPv6 addresses (blocks whitespace,

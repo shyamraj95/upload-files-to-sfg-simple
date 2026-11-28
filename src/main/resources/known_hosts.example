@@ -1,0 +1,36 @@
+# ==============================================================================
+# Example OpenSSH known_hosts file referenced by SFG_KNOWN_HOSTS_PATH
+# (e.g., /etc/sfg-exporter/keys/known_hosts)
+#
+# HOW TO GENERATE YOUR REAL known_hosts FILE:
+#   1. Fetch the IBM SFG server's public host key(s):
+#        ssh-keyscan -p 22 -t ed25519,ecdsa,rsa sfg-prod.internal.corp > known_hosts
+#      (If your SFG server uses a non-22 port, e.g. 2222, ssh-keyscan automatically
+#       writes the required bracketed format: [host]:2222)
+#        ssh-keyscan -p 2222 -t ed25519,ecdsa,rsa sfg-partner.internal.corp >> known_hosts
+#
+#   2. Verify the SHA-256 fingerprint(s) out-of-band with your IBM SFG admin:
+#        ssh-keygen -lf known_hosts
+#
+#   3. Lock down permissions (SshClientFactory rejects symlinks and world-writable files):
+#        chmod 640 known_hosts   # or chmod 600 known_hosts
+#
+#   4. Point SFG_KNOWN_HOSTS_PATH (in .env or systemd EnvironmentFile) to this regular file.
+#
+# FORMAT NOTE (Apache MINA SSHD KnownHostsServerKeyVerifier):
+#   - Port 22:     <hostname_or_ip> <key-type> <base64-public-key>
+#   - Custom port: [<hostname_or_ip>]:<port> <key-type> <base64-public-key>
+#   - Multiple aliases (comma-separated, e.g. hostname,ip) are supported.
+#   - Never leave placeholder keys below; replace every line using ssh-keyscan!
+# ==============================================================================
+
+# --- Port 22 example entries (standard SFTP port) ---
+sfg-prod.internal.corp ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI_REPLACE_WITH_REAL_SERVER_ED25519_HOST_KEY
+sfg-prod.internal.corp ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY_REPLACE_WITH_REAL_ECDSA_HOST_KEY
+sfg-prod.internal.corp ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ_REPLACE_WITH_REAL_RSA_HOST_KEY
+
+# --- Hostname + IP alias example (matches connections by either DNS name or IP) ---
+# sfg-prod.internal.corp,10.20.30.40 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI_REPLACE_WITH_REAL_SERVER_ED25519_HOST_KEY
+
+# --- Custom port example (brackets required whenever port != 22) ---
+# [sfg-partner.internal.corp]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI_REPLACE_WITH_PARTNER_ED25519_HOST_KEY

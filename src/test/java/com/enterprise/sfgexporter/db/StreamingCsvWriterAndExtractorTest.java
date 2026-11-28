@@ -90,7 +90,10 @@ class StreamingCsvWriterAndExtractorTest {
         Clock fixedClock = Clock.fixed(Instant.parse("2026-11-22T06:15:30Z"), ZoneOffset.UTC);
         this.stagingDir = tempDir.resolve("staging");
         this.csvWriter = new StreamingCsvWriter(stagingDir, fixedClock);
-        this.extractor = new OracleDataExtractor(dataSource, new DefaultResourceLoader(), csvWriter);
+        this.extractor = new OracleDataExtractor(
+                dataSource,
+                new DefaultResourceLoader(StreamingCsvWriterAndExtractorTest.class.getClassLoader()),
+                csvWriter);
     }
 
     /**
@@ -298,7 +301,8 @@ class StreamingCsvWriterAndExtractorTest {
         when(mockConn.prepareCall(anyString(), anyInt(), anyInt())).thenReturn(mockCs);
         doThrow(new SQLException("Invalid bind parameter")).when(mockCs).setObject(eq(1), any());
 
-        OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        OracleDataExtractor mockExtractor = new OracleDataExtractor(
+                mockDs, new DefaultResourceLoader(StreamingCsvWriterAndExtractorTest.class.getClassLoader()), csvWriter);
         ExportJobConfig job = ExportJobConfig.builder()
                 .name("proc_bind_fail")
                 .sourceType(SourceType.STORED_PROCEDURE)
@@ -399,11 +403,12 @@ class StreamingCsvWriterAndExtractorTest {
         Files.writeString(oversizedSql, "SELECT '" + "X".repeat(1_048_600) + "' FROM DUAL");
 
         DataSource mockDs = mock(DataSource.class);
-        OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        OracleDataExtractor mockExtractor = new OracleDataExtractor(
+                mockDs, new DefaultResourceLoader(StreamingCsvWriterAndExtractorTest.class.getClassLoader()), csvWriter);
         ExportJobConfig job = ExportJobConfig.builder()
                 .name("huge_sql")
                 .sourceType(SourceType.SQL_QUERY)
-                .sqlFile("file:" + oversizedSql.toAbsolutePath())
+                .sqlFile(toFileResourceUri(oversizedSql))
                 .filePrefix("HUGE_SQL")
                 .build();
 
@@ -428,7 +433,8 @@ class StreamingCsvWriterAndExtractorTest {
         when(mockConn.prepareStatement(anyString())).thenReturn(mockPs);
         doThrow(new SQLException("fetchSize unsupported")).when(mockPs).setFetchSize(anyInt());
 
-        OracleDataExtractor mockExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        OracleDataExtractor mockExtractor = new OracleDataExtractor(
+                mockDs, new DefaultResourceLoader(StreamingCsvWriterAndExtractorTest.class.getClassLoader()), csvWriter);
         ExportJobConfig job = ExportJobConfig.builder()
                 .name("sql_fetch_fail")
                 .sourceType(SourceType.SQL_QUERY)
@@ -510,7 +516,8 @@ class StreamingCsvWriterAndExtractorTest {
         when(mockRs.getObject(1)).thenReturn(101L);
         when(mockRs.getObject(2)).thenReturn(smallClob);
 
-        OracleDataExtractor procExtractor = new OracleDataExtractor(mockDs, new DefaultResourceLoader(), csvWriter);
+        OracleDataExtractor procExtractor = new OracleDataExtractor(
+                mockDs, new DefaultResourceLoader(StreamingCsvWriterAndExtractorTest.class.getClassLoader()), csvWriter);
         ExportJobConfig job = ExportJobConfig.builder()
                 .name("gl_proc_ok")
                 .sourceType(SourceType.STORED_PROCEDURE)
@@ -555,7 +562,7 @@ class StreamingCsvWriterAndExtractorTest {
         ExportJobConfig okJob = ExportJobConfig.builder()
                 .name("semi_sql")
                 .sourceType(SourceType.SQL_QUERY)
-                .sqlFile("file:" + semicolonSql.toAbsolutePath())
+                .sqlFile(toFileResourceUri(semicolonSql))
                 .parameters(Map.of("status", "PENDING"))
                 .filePrefix("SEMI_SQL")
                 .build();
@@ -569,7 +576,7 @@ class StreamingCsvWriterAndExtractorTest {
         ExportJobConfig emptySqlJob = ExportJobConfig.builder()
                 .name("blank_sql")
                 .sourceType(SourceType.SQL_QUERY)
-                .sqlFile("file:" + emptySql.toAbsolutePath())
+                .sqlFile(toFileResourceUri(emptySql))
                 .filePrefix("BLANK_SQL")
                 .build();
 
@@ -621,5 +628,9 @@ class StreamingCsvWriterAndExtractorTest {
         assertThat(headerOnly.hasFile()).isTrue();
         assertThat(headerOnly.rowCount()).isZero();
         assertThat(Files.readAllLines(headerOnly.filePath())).containsExactly("COL1");
+    }
+
+    private String toFileResourceUri(Path path) {
+        return "file:" + path.toAbsolutePath().normalize().toString().replace('\\', '/');
     }
 }

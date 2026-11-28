@@ -11,6 +11,7 @@ import org.apache.sshd.server.SshServer;
 import org.apache.sshd.sftp.client.SftpClient;
 import org.apache.sshd.sftp.server.SftpSubsystemFactory;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -19,6 +20,7 @@ import org.springframework.integration.file.remote.session.SessionFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -348,19 +350,26 @@ class AtomicSftpUploaderIntegrationTest {
      */
     @Test
     void rejectsSymlinkLocalFileAndSlashesInFileName() throws Exception {
-        Path outsideTarget = Files.writeString(tempDir.resolve("secret.csv"), "SECRET\n", StandardCharsets.UTF_8);
-        Path symlinkCsv = Files.createSymbolicLink(tempDir.resolve("link.csv"), outsideTarget);
-
         SftpSessionFactoryRegistry mockRegistry = mock(SftpSessionFactoryRegistry.class);
         AtomicSftpUploader uploader = new AtomicSftpUploader(mockRegistry);
-
-        assertThatThrownBy(() -> uploader.uploadAtomically(symlinkCsv, "sfg-test", "/finance"))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("symbolic link");
 
         assertThatThrownBy(() -> uploader.buildRemotePath("/inbound", "/finance", "../evil.csv"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("fileName");
+
+        Path outsideTarget = Files.writeString(tempDir.resolve("secret.csv"), "SECRET\n", StandardCharsets.UTF_8);
+        Path symlinkCsv;
+        try {
+            symlinkCsv = Files.createSymbolicLink(tempDir.resolve("link.csv"), outsideTarget);
+        } catch (FileSystemException | UnsupportedOperationException ex) {
+            Assumptions.assumeTrue(false,
+                    "Skipping symlink assertion (OS privilege unavailable): " + ex.getMessage());
+            return;
+        }
+
+        assertThatThrownBy(() -> uploader.uploadAtomically(symlinkCsv, "sfg-test", "/finance"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("symbolic link");
     }
 
     /**
